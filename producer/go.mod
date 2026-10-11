@@ -1,4 +1,4 @@
-module github.com/JoeSouthan/outbox-pg_logical_emit_message/producer
+module github.com/JoeSouthan/postgres-outbox-playground/producer
 
 go 1.26
 

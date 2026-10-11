@@ -5,6 +5,8 @@
 //	wal      SELECT pg_logical_emit_message(...)          (log message, no table)
 //	journal  INSERT INTO outbox_journal (..., lsn) with the emit inside the VALUES
 //	         (log message for delivery, append-only journal for recovery)
+//	cursor   INSERT INTO outbox_events                    (append-only, read by cursor;
+//	         no logical decoding, no deletes)
 //
 // Every statement in a transaction is pipelined in one batch so each worker keeps a
 // server backend busy; the worker count sets the concurrency. It talks to PgBouncer in
@@ -67,7 +69,7 @@ func main() {
 	var cfg config
 	var targets string
 	flag.StringVar(&cfg.dsn, "dsn", env("PRODUCER_DSN", "postgres://outbox:outbox@pgbouncer:5432/outbox"), "database DSN (normally PgBouncer)")
-	flag.StringVar(&cfg.mode, "mode", env("OUTBOX_MODE", "wal"), "transport: table | wal | journal")
+	flag.StringVar(&cfg.mode, "mode", env("OUTBOX_MODE", "wal"), "transport: table | wal | journal | cursor")
 	flag.StringVar(&targets, "targets", env("OUTBOX_TARGETS", "target_1"), "comma-separated targets, assigned round-robin per transaction")
 	flag.IntVar(&cfg.events, "events", envInt("PRODUCER_EVENTS", 100000), "total events to emit")
 	flag.IntVar(&cfg.perTxn, "per-txn", envInt("PRODUCER_PER_TXN", 10), "payments (and events) per transaction")
@@ -101,7 +103,7 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("ping: %w", err)
 	}
 
-	emitSQL, err := emitStatement(cfg.mode)
+	emitSQL, withKey, err := emitStatement(cfg.mode)
 	if err != nil {
 		return err
 	}
@@ -127,7 +129,7 @@ func run(ctx context.Context, cfg config) error {
 				target := cfg.targets[n%len(cfg.targets)]
 				rollback := cfg.rollbackEvery > 0 && n%cfg.rollbackEvery == 0
 				t0 := time.Now()
-				err := runTxn(ctx, pool, paymentSQL, emitSQL, target, n, cfg.perTxn, pad, rollback)
+				err := runTxn(ctx, pool, paymentSQL, emitSQL, withKey, target, n, cfg.perTxn, pad, rollback)
 				latencies[w] = append(latencies[w], float64(time.Since(t0).Microseconds())/1000.0)
 				switch {
 				case err != nil:
@@ -186,7 +188,7 @@ type rollbackMarker struct{}
 
 func (rollbackMarker) Error() string { return "rollback" }
 
-func runTxn(ctx context.Context, pool *pgxpool.Pool, paymentSQL, emitSQL, target string, n, perTxn int, pad string, rollback bool) error {
+func runTxn(ctx context.Context, pool *pgxpool.Pool, paymentSQL, emitSQL string, withKey bool, target string, n, perTxn int, pad string, rollback bool) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -197,7 +199,11 @@ func runTxn(ctx context.Context, pool *pgxpool.Pool, paymentSQL, emitSQL, target
 	for i := 0; i < perTxn; i++ {
 		ref := fmt.Sprintf("P%d-%d", n, i)
 		b.Queue(paymentSQL, ref, 100+i)
-		b.Queue(emitSQL, target, payload(target, ref, pad))
+		if withKey {
+			b.Queue(emitSQL, target, ref, payload(target, ref, pad))
+		} else {
+			b.Queue(emitSQL, target, payload(target, ref, pad))
+		}
 	}
 	br := tx.SendBatch(ctx, b)
 	for i := 0; i < b.Len(); i++ {
@@ -215,16 +221,20 @@ func runTxn(ctx context.Context, pool *pgxpool.Pool, paymentSQL, emitSQL, target
 	return tx.Commit(ctx)
 }
 
-func emitStatement(mode string) (string, error) {
+// emitStatement returns the per-event statement and whether it takes the ordering key
+// as a separate parameter (the cursor transport shards on it).
+func emitStatement(mode string) (string, bool, error) {
 	switch mode {
 	case "table":
-		return `INSERT INTO outbox_items (target, payload) VALUES ($1, $2)`, nil
+		return `INSERT INTO outbox_items (target, payload) VALUES ($1, $2)`, false, nil
 	case "wal":
-		return `SELECT pg_logical_emit_message(true, $1, $2::text)`, nil
+		return `SELECT pg_logical_emit_message(true, $1, $2::text)`, false, nil
 	case "journal":
-		return `INSERT INTO outbox_journal (target, payload, lsn) VALUES ($1, $2, pg_logical_emit_message(true, $1, $2::text))`, nil
+		return `INSERT INTO outbox_journal (target, payload, lsn) VALUES ($1, $2, pg_logical_emit_message(true, $1, $2::text))`, false, nil
+	case "cursor":
+		return `INSERT INTO outbox_events (target, key, payload) VALUES ($1, $2, $3)`, true, nil
 	}
-	return "", fmt.Errorf("unknown mode %q (table | wal | journal)", mode)
+	return "", false, fmt.Errorf("unknown mode %q (table | wal | journal | cursor)", mode)
 }
 
 // payload mirrors what an application would emit: an id for dedupe, a type, the

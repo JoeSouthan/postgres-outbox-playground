@@ -1,26 +1,3 @@
--- An empty publication: pgoutput requires one, but logical decoding messages are not
--- tied to any table, so we deliberately publish no tables. Only BEGIN / MESSAGE / COMMIT
--- records reach the relay.
-CREATE PUBLICATION outbox_pub;
-
--- Demo business table written by the producer.
-CREATE TABLE payments (
-  id           bigserial PRIMARY KEY,
-  reference    text        NOT NULL,
-  amount_cents integer     NOT NULL,
-  created_at   timestamptz NOT NULL DEFAULT now()
-);
-
--- Transport "table": the conventional outbox. A `target` column picks the destination;
--- a relay selects a batch FOR UPDATE SKIP LOCKED, publishes, deletes and commits.
-CREATE TABLE outbox_items (
-  id         bigserial PRIMARY KEY,
-  target     text        NOT NULL,
-  payload    text        NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX outbox_items_target_id ON outbox_items (target, id);
-
 -- Transport "journal": delivery still goes through the log message; this append-only
 -- table exists only for recovery and visibility. Nothing updates or deletes rows: the
 -- table is range-partitioned by day and old partitions are dropped after a retention
@@ -47,3 +24,4 @@ BEGIN
   END LOOP;
 END $$;
 CREATE TABLE outbox_journal_default PARTITION OF outbox_journal DEFAULT;
+

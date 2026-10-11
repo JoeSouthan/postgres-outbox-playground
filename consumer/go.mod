@@ -1,4 +1,4 @@
-module github.com/JoeSouthan/outbox-pg_logical_emit_message/consumer
+module github.com/JoeSouthan/postgres-outbox-playground/consumer
 
 go 1.26
 

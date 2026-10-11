@@ -1,5 +1,6 @@
-# Relay image: /relay (log-message relay, with optional journal recovery) and
-# /tablerelay (table-outbox baseline). CMD so `docker compose run relay /tablerelay` works.
+# Relay image: /relay (log-message relay, with optional journal recovery), /cursorrelay
+# (append-only table read by cursor) and /tablerelay (table-outbox baseline). CMD so
+# `docker compose run relay /tablerelay` works.
 FROM golang:1.26 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -8,5 +9,5 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /out/ ./...
 
 FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/relay /out/tablerelay /
+COPY --from=build /out/relay /out/tablerelay /out/cursorrelay /
 CMD ["/relay"]

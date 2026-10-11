@@ -1,8 +1,11 @@
-# Design: a transactional outbox without the outbox table
+# Design: low-churn transactional outboxes
 
 This document explains what the prototype is meant to do, how it differs from a
 conventional outbox table, and the trade-offs. It is written for an engineering
-audience deciding whether to take the approach further.
+audience deciding whether to take the approach further. It covers two families: the
+log-message transports, which remove the table and need logical decoding, and the
+cursor transport, which keeps a table but never deletes from it and needs nothing
+beyond an ordinary Postgres.
 
 ## The problem with a table outbox
 
@@ -19,7 +22,7 @@ just to hold steady. The write pattern is already minimal, so no change to the r
 query fixes this. The only way to remove the churn is to stop writing rows, or at least
 to stop deleting them.
 
-## The three transports
+## The table and the two log-message transports
 
 ```mermaid
 flowchart TB
@@ -81,6 +84,100 @@ targets' messages, so server-side decoding work scales with the number of target
 a handful of targets that is negligible; for dozens, one relay fanning out from one
 slot is the alternative, at the cost of shared lag.
 
+## The cursor transport: no slot, no deletes
+
+Enabling `wal_level = logical` is a cluster-wide decision with a restart, and on a
+shared instance it is often not one the outbox owner gets to make. The cursor transport
+is the answer for that case. It asks two things of the design: keep the producer's
+transactional guarantee, and leave as little behind as possible. It gives up the one
+thing only logical decoding can provide, commit order.
+
+```mermaid
+flowchart LR
+  P[producer txn<br/>INSERT business rows<br/>INSERT outbox_events] --> B[PgBouncer]
+  B --> PG[(outbox_events<br/>append-only, partitioned by day<br/>xid = writing txn, shard = hash key % 32)]
+  PG --- C[(outbox_cursor<br/>per target × shard:<br/>frontier xid,id + pending xids)]
+  R1[relay replica 1<br/>N workers] -->|lock a shard cursor<br/>FOR UPDATE SKIP LOCKED| C
+  R2[relay replica 2<br/>N workers] --> C
+  R1 -->|read forward, publish, advance| PS[[Pub/Sub topic]]
+  R2 --> PS
+```
+
+**Where the churn goes.** The producer inserts one row. The relay reads rows and
+updates one cursor row per batch, a HOT update on a one-row-per-shard table with a low
+fillfactor. Nothing deletes from the event table; daily partitions are dropped after a
+retention period. Dead tuples per event: zero. The relay also never locks or dirties a
+producer page, since its reads are ordinary snapshot reads, so the contention that
+collapsed the delete-based relay under concurrent load does not arise.
+
+**Why a plain id cursor is wrong, and what fixes it.** Sequence ids are assigned at
+insert time, not commit time. A slow transaction can hold a low id and commit after a
+fast one with a higher id has been read; a cursor that moved past the high id would
+never see the low one. Delete-based outboxes exist to avoid exactly this. The fix
+here is to record the writing transaction's id, `pg_current_xact_id()`, order by it, and
+let the cursor remember which transactions were still in flight when it passed them:
+
+- Every poll runs under one repeatable-read snapshot and reads the snapshot's in-flight
+  transaction list with `pg_current_snapshot()`.
+- The frontier moves forward through visible rows in `(xid, id)` order. Visible means
+  committed, so nothing uncommitted is ever published.
+- In-flight transaction ids below the new frontier go into the cursor's `pending` set.
+  On a later poll, pending ids no longer in flight have resolved; their rows, if they
+  committed, are read by a separate catch-up query and published first.
+
+The invariant: every committed row at or below the frontier has been published unless
+its transaction is in `pending`. A transaction held open for five minutes costs nothing
+while it runs and its rows arrive on the first poll after it commits. The simpler
+alternative, reading only below the snapshot's `xmin`, would stall publishing for the
+whole five minutes on every such transaction, which rules it out for any cluster that
+has them.
+
+**Shards are how replicas help.** One cursor per target would mean one active
+publisher, however many replicas you run. So the key is hashed into a fixed number of
+shards at insert time, in a stored generated column, and there is one cursor per
+shard. A key always lands in one shard and a shard has one lock holder at a time, so
+per-key order is as good as with a single cursor. Workers in every replica race over
+the shard cursors with `FOR UPDATE SKIP LOCKED`, holding the lock for exactly one
+batch. There is no assignment and nothing to rebalance: shards flow to free workers and
+a dead replica releases its locks on rollback. The shard count is the parallelism
+ceiling. It is fixed in the schema; changing it is a drain, a remap of the generated
+expression, and fresh cursor rows, with no data movement, because a shard owns a cursor
+position and not data. Postgres has no consistent hashing, and this design does not
+need it.
+
+**What it gives up.**
+
+- *Commit order.* Rows leave in transaction-id order, the order transactions first
+  wrote. Two transactions on the same key normally serialise on that key's business
+  row, so per-key order holds when that row is the transaction's first write. A
+  transaction that writes other rows first can take its id early and commit late. The
+  delete-based table has the same property; only logical decoding gives commit order.
+- *Push.* The relay polls. An idle deployment costs workers ÷ poll interval tiny
+  transactions per second, and new work is noticed within shards ÷ workers poll
+  intervals. LISTEN/NOTIFY cannot help through a transaction-mode pooler.
+- *A connection per in-flight batch.* Each worker holds a pooled connection, idle in
+  transaction, while it waits for Pub/Sub acks. Size the pool for replicas × workers,
+  give the relay an explicit idle-in-transaction timeout and a matching publish
+  deadline. If that ever pinches, a lease column on the cursor row would let the read
+  and the advance be two short transactions.
+- *Plan cache.* With no server-side prepared statements, every poll is planned, and
+  planning over a partitioned table touches the catalog for each partition. Keep the
+  partition count small, and let the lookback bound prune the rest.
+
+**Failure and dead letters.** A crash after publish and before commit republishes the
+batch; consumers dedupe on the outbox id. Transient publish errors roll the poll back
+and the cursor waits, which is the right behaviour for a broker outage. Permanent
+per-message rejections, such as a Pub/Sub schema violation, need a policy, because a
+cursor cannot skip a row the way a delete-based relay can: write the message to a
+dead-letter table in the same transaction that advances the cursor, resume the ordering
+key, and alert. The prototype does not implement that path; it is designed for.
+
+**Deployment.** A Deployment per target, exactly as a table-outbox publisher is run
+today, with topic, target, shard count and worker count from the environment. Replicas
+is the throughput knob. No volume, no StatefulSet, no leader election, no direct
+primary connection. Autoscale on the age of the oldest unpublished row, which is one
+index probe past each cursor, not on CPU.
+
 ## Benefits over the table
 
 - **Zero or append-only churn.** `wal` writes no rows. `journal` writes one row per
@@ -131,7 +228,8 @@ slot is the alternative, at the cost of shared lag.
   tables.
 - **One consumer per slot.** A second relay attaching to an active slot is refused, so
   deploys must stop the old instance before starting the new one, and scaling out means
-  more targets rather than competing workers on one target.
+  more targets rather than competing workers on one target. The cursor transport has
+  the opposite shape: any number of replicas, no slot.
 - **Bytes are still written.** The payload goes into the write-ahead log, which is
   fsynced, physically replicated and archived. The heap, index and vacuum costs are
   gone; the write itself is not. `journal` adds the row's own log records back.
@@ -163,8 +261,12 @@ slot is the alternative, at the cost of shared lag.
   storage.
 - Journal partition creation and retention automated, with retention longer than the
   longest outage you intend to survive.
-- A written decision per event type: `wal`, `journal` or `table`, based on whether the
-  event can be re-derived after a slot loss and on the platform's failover behaviour.
+- A written decision per event type: `wal`, `journal`, `cursor` or `table`, based on
+  whether logical decoding is available, whether the event can be re-derived after a
+  slot loss, and on the platform's failover behaviour.
+- For `cursor`: a dead-letter policy per target, pool sizing for replicas × workers,
+  an idle-in-transaction timeout for the relay role, and partition retention longer
+  than the longest relay outage you intend to survive.
 - Consumers idempotent on the message id.
 
 ## Open questions this prototype does not answer
