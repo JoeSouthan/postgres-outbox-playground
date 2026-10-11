@@ -227,7 +227,7 @@ reads are ordinary snapshot reads, so the contention that made the table relay's
 48× slower under load does not arise.
 
 With one leaf per shard, every insert is a right-edge append on that leaf's `(xid, id)`
-index. The benchmark's 100,000-event runs end with 6.1 MB of index at 88 percent leaf
+index. The benchmark's 100,000-event runs end with 6.4 MB of index at 88 percent leaf
 density and no fragmentation, against the journal's 4.1 MB at 92 percent. An earlier
 layout with a single `(target, shard, xid, id)` index per day had 32 interleaved
 insertion points and filled at 52 percent density and 8.8 MB; the per-shard leaves are
@@ -297,8 +297,8 @@ probe past each cursor, not on CPU.
 | R3 simple | ◐ | An ordinary table, visible and queryable in SQL, and one query per poll. The thing to understand is one invariant, the pending set, and it is stated above in a sentence. More to hold in your head than the table, far less than a replication slot. |
 | R4 no logical decoding | ✅ | Default `wal_level`, no slot, no replication role. The benchmark ran it on a plain Postgres. |
 | R5 PgBouncer | ✅ | Producer and publisher both through the pooler in transaction mode. The benchmark's publisher connections all went through `pgbouncer-cursor`. |
-| R6 long transactions | ✅ | The pending set exists for this. The benchmark held a transaction open for 30 seconds across a run: drain time 33.3 s against 31.1 s without it, and the held event published a few seconds after its commit via catch-up. |
-| R7 deployment per target, replicas | ✅ | Any number of replicas share a target through row locks alone, no leader, no state in the pod. One stream drained a 100,000 backlog in 29.5 s; 8 workers in 5.5 s; 8 × 2 replicas in 4.3 s. The ceiling is the target's shard count, set per target and grown online. |
+| R6 long transactions | ✅ | The pending set exists for this. The benchmark held a transaction open for 30 seconds across a run: drain time 32.8 s against 35.4 s without it, and the held event published a few seconds after its commit via catch-up. |
+| R7 deployment per target, replicas | ✅ | Any number of replicas share a target through row locks alone, no leader, no state in the pod. One stream drained a 100,000 backlog in 29.5 s; 8 workers in 6.7 s; 8 × 2 replicas in 4.7 s. The ceiling is the target's shard count, set per target and grown online. |
 | R8 at-least-once, never lose | ✅ | Publish then advance in one transaction; a crash republishes. No slot to lose. |
 | R9 cannot get stuck | ◐ | Designed, not built. The dead-letter page gives the mechanism, an escalation rule that does not depend on classifying error codes correctly, the bound on every other stall, and a one-statement replay. Until it is implemented, a permanently rejected message freezes its shard. |
 | R10 ordering | per key | Transaction-id order, which preserves per-key order in the normal case. Commit order is given up, and was not required. |
