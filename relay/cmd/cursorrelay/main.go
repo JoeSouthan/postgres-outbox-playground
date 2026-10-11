@@ -51,10 +51,8 @@ type config struct {
 	sink        string
 	sinkLatency time.Duration
 	batch       int
-	shards      int
 	workers     int
 	poll        time.Duration
-	lookback    time.Duration
 }
 
 func main() {
@@ -66,10 +64,8 @@ func main() {
 	flag.StringVar(&cfg.sink, "sink", env("RELAY_SINK", "simulated"), "where to publish: simulated | pubsub")
 	flag.DurationVar(&cfg.sinkLatency, "sink-latency", envDuration("RELAY_SINK_LATENCY", 200*time.Millisecond), "simulated sink: cost of one publish batch")
 	flag.IntVar(&cfg.batch, "batch", envInt("RELAY_BATCH", 1000), "rows per poll per shard")
-	flag.IntVar(&cfg.shards, "shards", envInt("RELAY_SHARDS", 32), "shard count; must match the modulus in the outbox_events.shard column")
 	flag.IntVar(&cfg.workers, "workers", envInt("RELAY_WORKERS", 8), "concurrent pollers in this replica; each holds one connection during a batch")
 	flag.DurationVar(&cfg.poll, "poll", envDuration("RELAY_POLL", 100*time.Millisecond), "sleep after a poll that found nothing")
-	flag.DurationVar(&cfg.lookback, "lookback", envDuration("RELAY_LOOKBACK", 7*24*time.Hour), "only read rows newer than this; set it to the partition retention so old partitions are pruned")
 	flag.Parse()
 	if cfg.topic == "" {
 		cfg.topic = "outbox-" + cfg.target
@@ -103,13 +99,23 @@ func run(ctx context.Context, cfg config) error {
 	}
 	defer pool.Close()
 
+	// The shard count is the target's partition modulus, from outbox_targets, or the
+	// default for targets that share the default child. It is inlined into the poll
+	// queries as a literal so the planner can prune to one leaf per day partition.
+	var shards int
+	var listed bool
+	if err := pool.QueryRow(ctx, `SELECT coalesce(t.shards, outbox_default_shards()), t.shards IS NOT NULL FROM (SELECT 1) x LEFT JOIN outbox_targets t ON t.target = $1`, cfg.target).Scan(&shards, &listed); err != nil {
+		return fmt.Errorf("shard count: %w", err)
+	}
 	// Cursor rows start at frontier (0, 0). Idempotent, so every replica can run it.
-	if _, err := pool.Exec(ctx, `INSERT INTO outbox_cursor (target, shard) SELECT $1, generate_series(0, $2 - 1) ON CONFLICT DO NOTHING`, cfg.target, cfg.shards); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO outbox_cursor (target, shard) SELECT $1, generate_series(0, $2 - 1) ON CONFLICT DO NOTHING`, cfg.target, shards); err != nil {
 		return fmt.Errorf("init cursors: %w", err)
 	}
-	log.Printf("relaying outbox_events target=%s topic=%s shards=%d workers=%d batch=%d", cfg.target, cfg.topic, cfg.shards, cfg.workers, cfg.batch)
+	log.Printf("relaying outbox_events target=%s topic=%s shards=%d (own partitions: %v) workers=%d batch=%d", cfg.target, cfg.topic, shards, listed, cfg.workers, cfg.batch)
 
-	r := &relay{cfg: cfg, pool: pool, sink: snk}
+	r := &relay{cfg: cfg, pool: pool, sink: snk, shards: shards,
+		catchupSQL:  fmt.Sprintf(catchupSQLTmpl, shards),
+		frontierSQL: fmt.Sprintf(frontierSQLTmpl, shards)}
 	var wg sync.WaitGroup
 	for w := 0; w < cfg.workers; w++ {
 		wg.Add(1)
@@ -123,11 +129,14 @@ func run(ctx context.Context, cfg config) error {
 }
 
 type relay struct {
-	cfg   config
-	pool  *pgxpool.Pool
-	sink  sink.Sink
-	next  atomic.Int64 // round-robin shard dispenser shared by the workers
-	total atomic.Int64
+	cfg         config
+	pool        *pgxpool.Pool
+	sink        sink.Sink
+	shards      int
+	catchupSQL  string // catchupSQLTmpl with this target's modulus inlined
+	frontierSQL string
+	next        atomic.Int64 // round-robin shard dispenser shared by the workers
+	total       atomic.Int64
 }
 
 // worker polls shards until stopped. A full batch means the shard has a backlog, so
@@ -137,7 +146,7 @@ type relay struct {
 // within about shards/workers poll intervals.
 func (r *relay) worker(ctx context.Context, w int) {
 	for ctx.Err() == nil {
-		shard := int(r.next.Add(1)-1) % r.cfg.shards
+		shard := int(r.next.Add(1)-1) % r.shards
 		for ctx.Err() == nil {
 			n, full, err := r.pollOnce(ctx, shard)
 			if err != nil {
@@ -163,33 +172,40 @@ const (
 	// One statement claims the cursor and captures the in-flight transaction list from
 	// the same snapshot the rest of the poll will read under (repeatable read).
 	claimSQL = `
-		SELECT xid, id, pending, array(SELECT pg_snapshot_xip(pg_current_snapshot()))
+		SELECT xid, id, pending, catchup_xid, catchup_id, array(SELECT pg_snapshot_xip(pg_current_snapshot()))
 		FROM outbox_cursor
 		WHERE target = $1 AND shard = $2
 		FOR UPDATE SKIP LOCKED`
 
-	// Rows of transactions that were pending and have since resolved. Aborted ones are
-	// simply not visible, so nothing special is needed for them.
-	catchupSQL = `
+	// Rows of transactions that were pending and have since resolved, in (xid, id)
+	// order and bounded by the batch size, resuming after the catch-up watermark for the
+	// one transaction a previous poll left half-read. Aborted transactions are simply
+	// not visible, so nothing special is needed for them. The modulus is a literal (%d)
+	// so target + shard prune to one leaf per day partition. There is no time bound: a
+	// row is never skipped because it is old; partitions are dropped by
+	// outbox_drop_partitions only once every cursor is past them.
+	catchupSQLTmpl = `
 		SELECT id, xid, key, payload
 		FROM outbox_events
-		WHERE target = $1 AND shard = $2 AND created_at >= now() - $3::interval
-		  AND xid = ANY($4::xid8[])
-		ORDER BY xid, id`
-
-	// Forward from the frontier. Only committed rows are visible; a row from an
-	// in-flight transaction with a lower xid will be picked up by catch-up later.
-	frontierSQL = `
-		SELECT id, xid, key, payload
-		FROM outbox_events
-		WHERE target = $1 AND shard = $2 AND created_at >= now() - $3::interval
-		  AND (xid, id) > ($4::xid8, $5::bigint)
+		WHERE target = $1 AND outbox_shard(key, %d) = $2
+		  AND xid = ANY($3::xid8[])
+		  AND (xid <> $4::xid8 OR id > $5::bigint)
 		ORDER BY xid, id
 		LIMIT $6`
 
+	// Forward from the frontier. Only committed rows are visible; a row from an
+	// in-flight transaction with a lower xid will be picked up by catch-up later.
+	frontierSQLTmpl = `
+		SELECT id, xid, key, payload
+		FROM outbox_events
+		WHERE target = $1 AND outbox_shard(key, %d) = $2
+		  AND (xid, id) > ($3::xid8, $4::bigint)
+		ORDER BY xid, id
+		LIMIT $5`
+
 	advanceSQL = `
-		UPDATE outbox_cursor SET xid = $1, id = $2, pending = $3, updated_at = now()
-		WHERE target = $4 AND shard = $5`
+		UPDATE outbox_cursor SET xid = $1, id = $2, pending = $3, catchup_xid = $4, catchup_id = $5, updated_at = now()
+		WHERE target = $6 AND shard = $7`
 )
 
 type row struct {
@@ -209,12 +225,12 @@ func (r *relay) pollOnce(ctx context.Context, shard int) (published int, full bo
 	defer tx.Rollback(context.Background())
 
 	var (
-		curXid  uint64
-		curID   int64
-		pending []uint64
-		xip     []uint64
+		curXid, cuXid uint64
+		curID, cuID   int64
+		pending       []uint64
+		xip           []uint64
 	)
-	err = tx.QueryRow(ctx, claimSQL, r.cfg.target, shard).Scan(&curXid, &curID, &pending, &xip)
+	err = tx.QueryRow(ctx, claimSQL, r.cfg.target, shard).Scan(&curXid, &curID, &pending, &cuXid, &cuID, &xip)
 	if errors.Is(err, pgx.ErrNoRows) || isSerializationFailure(err) {
 		return 0, false, nil // another worker holds this shard
 	}
@@ -237,26 +253,43 @@ func (r *relay) pollOnce(ctx context.Context, shard int) (published int, full bo
 
 	var msgs []*pubsub.Message
 	catchup := 0
+	newXid, newID := curXid, curID
+	newCuXid, newCuID := uint64(0), int64(0)
+	newPending := append([]uint64{}, still...) // never nil: nil would encode as SQL NULL
 	if len(resolved) > 0 {
-		rows, err := readRows(ctx, tx, catchupSQL, r.cfg.target, shard, r.cfg.lookback, resolved)
+		crows, err := readRows(ctx, tx, r.catchupSQL, r.cfg.target, shard, resolved, cuXid, cuID, r.cfg.batch)
 		if err != nil {
 			return 0, false, fmt.Errorf("catch-up: %w", err)
 		}
-		catchup = len(rows)
-		for _, rw := range rows {
+		catchup = len(crows)
+		for _, rw := range crows {
 			msgs = append(msgs, r.toMessage(rw, shard, true))
 		}
+		if catchup == r.cfg.batch {
+			// The batch may have cut a transaction short. Rows come in (xid, id) order,
+			// so every resolved transaction below the last row's xid is exhausted; the
+			// last one stays pending behind a watermark, and the ones above it wait.
+			last := crows[len(crows)-1]
+			newCuXid, newCuID = last.xid, last.id
+			for _, x := range resolved {
+				if x >= last.xid {
+					newPending = append(newPending, x)
+				}
+			}
+			full = true
+		}
 	}
-	rows, err := readRows(ctx, tx, frontierSQL, r.cfg.target, shard, r.cfg.lookback, curXid, curID, r.cfg.batch)
-	if err != nil {
-		return 0, false, fmt.Errorf("frontier: %w", err)
-	}
-	for _, rw := range rows {
-		msgs = append(msgs, r.toMessage(rw, shard, false))
+	var rows []row
+	if !full { // a full catch-up batch owns this poll; the frontier waits for the next
+		rows, err = readRows(ctx, tx, r.frontierSQL, r.cfg.target, shard, curXid, curID, r.cfg.batch)
+		if err != nil {
+			return 0, false, fmt.Errorf("frontier: %w", err)
+		}
+		for _, rw := range rows {
+			msgs = append(msgs, r.toMessage(rw, shard, false))
+		}
 	}
 
-	newXid, newID := curXid, curID
-	newPending := append([]uint64{}, still...) // never nil: nil would encode as SQL NULL
 	if len(rows) > 0 {
 		last := rows[len(rows)-1]
 		newXid, newID = last.xid, last.id
@@ -278,7 +311,7 @@ func (r *relay) pollOnce(ctx context.Context, shard int) (published int, full bo
 		}
 	}
 	// Everything is in Pub/Sub; now the cursor may move.
-	if _, err := tx.Exec(ctx, advanceSQL, newXid, newID, newPending, r.cfg.target, shard); err != nil {
+	if _, err := tx.Exec(ctx, advanceSQL, newXid, newID, newPending, newCuXid, newCuID, r.cfg.target, shard); err != nil {
 		return 0, false, fmt.Errorf("advance: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -288,7 +321,7 @@ func (r *relay) pollOnce(ctx context.Context, shard int) (published int, full bo
 		total := r.total.Add(int64(len(msgs)))
 		log.Printf("published %d (shard=%d catchup=%d pending=%d) total=%d", len(msgs), shard, catchup, len(newPending), total)
 	}
-	return len(msgs), len(rows) >= r.cfg.batch, nil
+	return len(msgs), full || len(rows) >= r.cfg.batch, nil
 }
 
 func readRows(ctx context.Context, tx pgx.Tx, sql string, args ...any) ([]row, error) {

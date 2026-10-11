@@ -78,6 +78,7 @@ start_relay() { # mode logfile  (cursor: one container per replica, logfile.rN.l
   local se=(-e RELAY_SINK="$SINK" -e RELAY_SINK_LATENCY="$SINK_LATENCY")
   RELAY_PIDS=()
   if [ "$1" = cursor ]; then
+    rm -f "${2%.log}".r*.log   # stale replica logs from a run with more replicas would be summed in
     for i in $(seq 1 "$CURSOR_REPLICAS"); do
       docker rm -f "$RELAY_CONTAINER-$i" >/dev/null 2>&1 || true
       docker compose run --rm -T --name "$RELAY_CONTAINER-$i" "${se[@]}" -e RELAY_WORKERS="$CURSOR_WORKERS" \
