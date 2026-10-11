@@ -134,7 +134,7 @@ progress. Each has a bound that is set in configuration, not a human.
 |---|---|---|
 | Cursor row locked by a dead connection | Relay pod vanished mid-publish without closing the socket | `idle_in_transaction_session_timeout` on the relay role, set to the publish deadline plus margin; PgBouncer closes the server side when the client goes. Tens of seconds, never minutes. |
 | Backed-off shard | `retry_after` set by a failing poll | Capped at one minute; compared and set with the database's `now()`, so replica clock skew cannot extend it. |
-| Hot shard holding a worker | Full batch after full batch on one shard | A worker moves on after a fixed number of consecutive full batches, say ten, so one busy key range cannot starve the others on a small Deployment. |
+| Hot shard holding a worker | Full batch after full batch on one shard | Built: a worker moves on after ten consecutive full batches (`-max-full`), so one busy key range cannot starve the others on a small Deployment. |
 | Ordering key paused in the client | Any failed publish on that key | `ResumePublish` on every failed key before the poll returns; after *N* failures the publisher handle is recreated. |
 | Rows ageing out of a time window | A shard stalled longer than a read window | Removed. The relay's reads have no time bound, and retention drops a day only when `outbox_droppable_partitions` lists it: every cursor for every target is past its highest `xid` and no pending transaction id is at or below it. Nothing can age out unpublished. |
 | Pending transaction that never ends | A session idle in transaction with no timeout | Not a stall: the frontier keeps moving and only that xid stays in the set. It is the same session that is holding back vacuum for the whole database, and the fix is the same `idle_in_transaction_session_timeout`. |
@@ -288,7 +288,7 @@ The pieces needed to exercise all of this against the simulated sink, in order:
 3. The producer gains `-poison N` to mark every Nth payload.
 4. The cursor relay partitions outcomes, writes dead letters, uses the backoff
    columns, escalates after *N* failures when another cursor has advanced recently or
-   a sibling was delivered, and caps consecutive full batches per shard.
+   a sibling was delivered.
 5. A `poison` bench scenario: a hundred thousand events with one percent poisoned must
    end with exactly 99,000 published, 1,000 open dead letters, no stuck shard, and a
    clean replay of the 1,000 once the reject pattern is removed.

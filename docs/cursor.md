@@ -159,12 +159,18 @@ grow as below. Online, no restart.
 of the current count. It locks the target's cursor rows for the duration of one
 statement, which waits for any poll in flight, copies each cursor to the new shards it
 splits into (the keys of new shard `s + k·old` are a subset of old shard `s`, so its
-frontier is exact and nothing is republished), rewrites `outbox_targets`, and rebuilds
-the still-empty future days with the new modulus. Today's leaves keep the old modulus
-until the day ages out; polls on them are correct but scan that day's leaves of the
-target with a filter rather than pruning to one. Then restart the target's publishers
-so they poll the new shards. Online; the restart is a rolling one. Making the relay
-re-read its shard count every few seconds would remove even that.
+frontier is exact and nothing is republished), rewrites `outbox_targets` with the old
+count kept in `previous_shards`, and rebuilds the still-empty future days with the new
+modulus. Today's leaves keep the old modulus until the day ages out. Nothing else is
+needed: every publisher re-reads `outbox_targets` every few seconds (`-refresh`),
+creates any missing cursor rows, which the reshard has already positioned, and widens
+its round-robin. While `previous_shards` is set the poll predicate names both moduli,
+`outbox_shard(key, old) = s % old AND outbox_shard(key, new) = s`, so partitions built
+with either prune to one leaf; the partition job calls
+`outbox_clear_previous_shards()` and the extra term disappears once no attached day
+carries the old modulus. Fully online, no restart, no day of degraded pruning. The
+same mechanism covers promotion with a larger count than the default: the default
+count is the previous one.
 
 **Shrinking.** Not exact online, because merging cursors has no subset property. Two
 ways. Pause the target's publishers until every cursor has caught up, give each new
@@ -268,9 +274,11 @@ connection for the length of a batch, mostly waiting on acks, so size the pool f
 replicas × workers and give the relay role an idle-in-transaction timeout matched to
 the publish deadline.
 
-A worker sleeps for the poll interval after an empty poll, so an idle deployment runs
-about workers ÷ poll interval tiny transactions per second and notices new work on any
-shard within roughly shards ÷ workers poll intervals. Every poll is planned, and
+A worker sleeps after an empty poll, starting at the poll interval and doubling for
+every full sweep of the shards that found nothing, up to a ceiling of one second, so an
+idle deployment settles at about workers per second in tiny transactions and still
+notices new work within a second. A worker also leaves a shard after ten consecutive
+full batches so one hot key range cannot starve the rest. Every poll is planned, and
 planning walks the day partitions and prunes each to one leaf, so the cost grows with
 the number of days retained and, more slowly, with the number of leaves.
 

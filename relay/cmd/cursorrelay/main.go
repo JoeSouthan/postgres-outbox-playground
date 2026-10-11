@@ -53,6 +53,9 @@ type config struct {
 	batch       int
 	workers     int
 	poll        time.Duration
+	pollMax     time.Duration
+	maxFull     int
+	refresh     time.Duration
 }
 
 func main() {
@@ -66,6 +69,9 @@ func main() {
 	flag.IntVar(&cfg.batch, "batch", envInt("RELAY_BATCH", 1000), "rows per poll per shard")
 	flag.IntVar(&cfg.workers, "workers", envInt("RELAY_WORKERS", 8), "concurrent pollers in this replica; each holds one connection during a batch")
 	flag.DurationVar(&cfg.poll, "poll", envDuration("RELAY_POLL", 100*time.Millisecond), "sleep after a poll that found nothing")
+	flag.DurationVar(&cfg.pollMax, "poll-max", envDuration("RELAY_POLL_MAX", time.Second), "the sleep stretches towards this while every shard stays empty")
+	flag.IntVar(&cfg.maxFull, "max-full", envInt("RELAY_MAX_FULL", 10), "consecutive full batches a worker takes from one shard before moving on")
+	flag.DurationVar(&cfg.refresh, "refresh", envDuration("RELAY_REFRESH", 5*time.Second), "how often to re-read the target's shard count from outbox_targets")
 	flag.Parse()
 	if cfg.topic == "" {
 		cfg.topic = "outbox-" + cfg.target
@@ -99,24 +105,25 @@ func run(ctx context.Context, cfg config) error {
 	}
 	defer pool.Close()
 
-	// The shard count is the target's partition modulus, from outbox_targets, or the
-	// default for targets that share the default child. It is inlined into the poll
-	// queries as a literal so the planner can prune to one leaf per day partition.
-	var shards int
-	var listed bool
-	if err := pool.QueryRow(ctx, `SELECT coalesce(t.shards, outbox_default_shards()), t.shards IS NOT NULL FROM (SELECT 1) x LEFT JOIN outbox_targets t ON t.target = $1`, cfg.target).Scan(&shards, &listed); err != nil {
-		return fmt.Errorf("shard count: %w", err)
+	r := &relay{cfg: cfg, pool: pool, sink: snk}
+	if _, err := r.refreshShards(ctx); err != nil {
+		return err
 	}
-	// Cursor rows start at frontier (0, 0). Idempotent, so every replica can run it.
-	if _, err := pool.Exec(ctx, `INSERT INTO outbox_cursor (target, shard) SELECT $1, generate_series(0, $2 - 1) ON CONFLICT DO NOTHING`, cfg.target, shards); err != nil {
-		return fmt.Errorf("init cursors: %w", err)
-	}
-	log.Printf("relaying outbox_events target=%s topic=%s shards=%d (own partitions: %v) workers=%d batch=%d", cfg.target, cfg.topic, shards, listed, cfg.workers, cfg.batch)
-
-	r := &relay{cfg: cfg, pool: pool, sink: snk, shards: shards,
-		catchupSQL:  fmt.Sprintf(catchupSQLTmpl, shards),
-		frontierSQL: fmt.Sprintf(frontierSQLTmpl, shards)}
 	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { // a grow via outbox_reshard is picked up here; no restart needed
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(cfg.refresh):
+				if _, err := r.refreshShards(ctx); err != nil {
+					log.Printf("refresh shards: %v (will retry)", err)
+				}
+			}
+		}
+	}()
 	for w := 0; w < cfg.workers; w++ {
 		wg.Add(1)
 		go func(w int) {
@@ -129,26 +136,74 @@ func run(ctx context.Context, cfg config) error {
 }
 
 type relay struct {
-	cfg         config
-	pool        *pgxpool.Pool
-	sink        sink.Sink
+	cfg   config
+	pool  *pgxpool.Pool
+	sink  sink.Sink
+	plan  atomic.Pointer[shardPlan] // swapped whole when the shard count changes
+	next  atomic.Int64              // round-robin shard dispenser shared by the workers
+	total atomic.Int64
+}
+
+// shardPlan is everything that depends on the target's shard count: the count itself
+// and the poll queries with the modulus inlined as a literal so the planner prunes to
+// one leaf per day partition.
+type shardPlan struct {
 	shards      int
-	catchupSQL  string // catchupSQLTmpl with this target's modulus inlined
+	previous    int // modulus older partitions may still carry; 0 when none
+	catchupSQL  string
 	frontierSQL string
-	next        atomic.Int64 // round-robin shard dispenser shared by the workers
-	total       atomic.Int64
+}
+
+// refreshShards reads the target's shard count, the modulus its older partitions may
+// still carry, and whether it has its own partitions, from outbox_targets (the default
+// count for targets that share the default child). On a change it creates any missing
+// cursor rows, which outbox_reshard has already positioned, and swaps the plan. The
+// predicate names both moduli while previous_shards is set, so polls prune to one leaf
+// on partitions built with either; a grow is a multiple of the old count, so a key in
+// shard s is in old shard s % old.
+func (r *relay) refreshShards(ctx context.Context) (changed bool, err error) {
+	var shards, previous int
+	var listed bool
+	err = r.pool.QueryRow(ctx, `SELECT coalesce(t.shards, outbox_default_shards()), coalesce(t.previous_shards, 0), t.shards IS NOT NULL
+		FROM (SELECT 1) x LEFT JOIN outbox_targets t ON t.target = $1`, r.cfg.target).Scan(&shards, &previous, &listed)
+	if err != nil {
+		return false, fmt.Errorf("shard count: %w", err)
+	}
+	if previous == shards {
+		previous = 0
+	}
+	if cur := r.plan.Load(); cur != nil && cur.shards == shards && cur.previous == previous {
+		return false, nil
+	}
+	// Cursor rows start at frontier (0, 0). Idempotent, so every replica can run it.
+	if _, err := r.pool.Exec(ctx, `INSERT INTO outbox_cursor (target, shard) SELECT $1, generate_series(0, $2 - 1) ON CONFLICT DO NOTHING`, r.cfg.target, shards); err != nil {
+		return false, fmt.Errorf("init cursors: %w", err)
+	}
+	where := fmt.Sprintf("target = $1 AND outbox_shard(key, %d) = $2", shards)
+	if previous > 0 {
+		where = fmt.Sprintf("target = $1 AND outbox_shard(key, %d) = $2 %% %d AND outbox_shard(key, %d) = $2", previous, previous, shards)
+	}
+	r.plan.Store(&shardPlan{shards: shards, previous: previous,
+		catchupSQL: fmt.Sprintf(catchupSQLTmpl, where), frontierSQL: fmt.Sprintf(frontierSQLTmpl, where)})
+	log.Printf("relaying outbox_events target=%s topic=%s shards=%d previous=%d (own partitions: %v) workers=%d batch=%d", r.cfg.target, r.cfg.topic, shards, previous, listed, r.cfg.workers, r.cfg.batch)
+	return true, nil
 }
 
 // worker polls shards until stopped. A full batch means the shard has a backlog, so
-// the worker stays on it; a partial batch moves on to the next shard immediately; an
-// empty poll sleeps for the poll interval first. At idle the deployment therefore costs
-// workers/poll tiny transactions per second, and new work on any shard is noticed
-// within about shards/workers poll intervals.
+// the worker stays on it, up to -max-full batches so one hot shard cannot starve the
+// rest on a small deployment; a partial batch moves on to the next shard immediately;
+// an empty poll sleeps first. The sleep starts at -poll and doubles for every full
+// sweep of the shards that found nothing, up to -poll-max, so an idle deployment costs
+// workers/poll-max tiny transactions per second and new work is still noticed within
+// about poll-max.
 func (r *relay) worker(ctx context.Context, w int) {
+	idle := 0 // consecutive empty polls
 	for ctx.Err() == nil {
-		shard := int(r.next.Add(1)-1) % r.shards
+		plan := r.plan.Load()
+		shard := int(r.next.Add(1)-1) % plan.shards
+		fulls := 0
 		for ctx.Err() == nil {
-			n, full, err := r.pollOnce(ctx, shard)
+			n, full, err := r.pollOnce(ctx, plan, shard)
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
 					return
@@ -157,15 +212,33 @@ func (r *relay) worker(ctx context.Context, w int) {
 				sleep(ctx, r.cfg.poll)
 				break
 			}
+			if n > 0 {
+				idle = 0
+			}
 			if full {
-				continue // keep draining this shard
+				fulls++
+				if fulls < r.cfg.maxFull {
+					continue // keep draining this shard
+				}
+				break // hot shard: give the others a turn, come straight back
 			}
 			if n == 0 {
-				sleep(ctx, r.cfg.poll)
+				idle++
+				sleep(ctx, r.backoff(idle, plan.shards))
 			}
 			break
 		}
 	}
+}
+
+// backoff is the sleep after the idle-th consecutive empty poll: -poll until a whole
+// sweep of the shards has been empty, then doubling per further sweep up to -poll-max.
+func (r *relay) backoff(idle, shards int) time.Duration {
+	d := r.cfg.poll
+	for sweeps := idle / max(shards, 1); sweeps > 0 && d < r.cfg.pollMax; sweeps-- {
+		d *= 2
+	}
+	return min(d, r.cfg.pollMax)
 }
 
 const (
@@ -180,14 +253,15 @@ const (
 	// Rows of transactions that were pending and have since resolved, in (xid, id)
 	// order and bounded by the batch size, resuming after the catch-up watermark for the
 	// one transaction a previous poll left half-read. Aborted transactions are simply
-	// not visible, so nothing special is needed for them. The modulus is a literal (%d)
-	// so target + shard prune to one leaf per day partition. There is no time bound: a
+	// not visible, so nothing special is needed for them. The WHERE clause (%s) comes
+	// from the shard plan with the modulus inlined, so target + shard prune to one leaf
+	// per day partition. There is no time bound: a
 	// row is never skipped because it is old; partitions are dropped by
 	// outbox_drop_partitions only once every cursor is past them.
 	catchupSQLTmpl = `
 		SELECT id, xid, key, payload
 		FROM outbox_events
-		WHERE target = $1 AND outbox_shard(key, %d) = $2
+		WHERE %s
 		  AND xid = ANY($3::xid8[])
 		  AND (xid <> $4::xid8 OR id > $5::bigint)
 		ORDER BY xid, id
@@ -198,7 +272,7 @@ const (
 	frontierSQLTmpl = `
 		SELECT id, xid, key, payload
 		FROM outbox_events
-		WHERE target = $1 AND outbox_shard(key, %d) = $2
+		WHERE %s
 		  AND (xid, id) > ($3::xid8, $4::bigint)
 		ORDER BY xid, id
 		LIMIT $5`
@@ -217,7 +291,7 @@ type row struct {
 
 // pollOnce runs one poll transaction for a shard. It returns the number of messages
 // published and whether the frontier read filled the batch, meaning there is more.
-func (r *relay) pollOnce(ctx context.Context, shard int) (published int, full bool, err error) {
+func (r *relay) pollOnce(ctx context.Context, plan *shardPlan, shard int) (published int, full bool, err error) {
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		return 0, false, err
@@ -257,7 +331,7 @@ func (r *relay) pollOnce(ctx context.Context, shard int) (published int, full bo
 	newCuXid, newCuID := uint64(0), int64(0)
 	newPending := append([]uint64{}, still...) // never nil: nil would encode as SQL NULL
 	if len(resolved) > 0 {
-		crows, err := readRows(ctx, tx, r.catchupSQL, r.cfg.target, shard, resolved, cuXid, cuID, r.cfg.batch)
+		crows, err := readRows(ctx, tx, plan.catchupSQL, r.cfg.target, shard, resolved, cuXid, cuID, r.cfg.batch)
 		if err != nil {
 			return 0, false, fmt.Errorf("catch-up: %w", err)
 		}
@@ -281,7 +355,7 @@ func (r *relay) pollOnce(ctx context.Context, shard int) (published int, full bo
 	}
 	var rows []row
 	if !full { // a full catch-up batch owns this poll; the frontier waits for the next
-		rows, err = readRows(ctx, tx, r.frontierSQL, r.cfg.target, shard, curXid, curID, r.cfg.batch)
+		rows, err = readRows(ctx, tx, plan.frontierSQL, r.cfg.target, shard, curXid, curID, r.cfg.batch)
 		if err != nil {
 			return 0, false, fmt.Errorf("frontier: %w", err)
 		}

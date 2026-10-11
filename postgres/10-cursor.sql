@@ -32,12 +32,18 @@ CREATE FUNCTION outbox_default_shards() RETURNS int IMMUTABLE LANGUAGE sql RETUR
 -- Targets that get their own partition subtree, and how many shards each has. The
 -- relay reads its shard count from here; a target that is not listed uses the default
 -- child and outbox_default_shards().
+-- previous_shards is the modulus that partitions already on disk may still have been
+-- built with: the default count for a newly promoted target, the old count after a
+-- grow. While it is set the relay adds a second predicate term for it, so polls stay
+-- pruned to one leaf on old and new partitions alike; outbox_clear_previous_shards()
+-- nulls it once every attached day carries the current modulus.
 CREATE TABLE outbox_targets (
-  target     text PRIMARY KEY,
-  shards     int  NOT NULL CHECK (shards > 0),
-  created_at timestamptz NOT NULL DEFAULT now()
+  target          text PRIMARY KEY,
+  shards          int  NOT NULL CHECK (shards > 0),
+  previous_shards int  DEFAULT outbox_default_shards() CHECK (previous_shards IS NULL OR shards % previous_shards = 0),
+  created_at      timestamptz NOT NULL DEFAULT now()
 );
-INSERT INTO outbox_targets (target, shards) VALUES ('target_1', 32), ('target_2', 4);
+INSERT INTO outbox_targets (target, shards, previous_shards) VALUES ('target_1', 32, NULL), ('target_2', 4, NULL);
 
 CREATE TABLE outbox_events (
   id         bigint      GENERATED ALWAYS AS IDENTITY,
@@ -126,7 +132,7 @@ BEGIN
     FROM outbox_cursor, generate_series(1, p_shards / old - 1) k
     WHERE target = p_target
   ON CONFLICT DO NOTHING;
-  UPDATE outbox_targets SET shards = p_shards WHERE target = p_target;
+  UPDATE outbox_targets SET shards = p_shards, previous_shards = coalesce(previous_shards, old) WHERE target = p_target;
   FOR r IN
     SELECT c.relname, to_date(substr(c.relname, 15, 8), 'YYYYMMDD') AS day
     FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
@@ -137,6 +143,28 @@ BEGIN
     IF n = 0 THEN
       EXECUTE format('DROP TABLE %I', format('%s_%s', r.relname, outbox_ident(p_target)));
       PERFORM outbox_create_target_partition(r.relname, p_target, p_shards);
+    END IF;
+  END LOOP;
+END $$;
+
+-- Null previous_shards for every target whose attached days all carry its current
+-- modulus (a subtree partitioned by outbox_shard(key, shards)). Run from the partition
+-- job after creating days and after retention has dropped old ones.
+CREATE FUNCTION outbox_clear_previous_shards() RETURNS setof text
+LANGUAGE plpgsql AS $$
+DECLARE t record; stale int;
+BEGIN
+  FOR t IN SELECT target, shards FROM outbox_targets WHERE previous_shards IS NOT NULL LOOP
+    SELECT count(*) INTO stale
+    FROM pg_inherits i JOIN pg_class d ON d.oid = i.inhrelid
+    WHERE i.inhparent = 'outbox_events'::regclass AND d.relname ~ '^outbox_events_\d{8}$'
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_class sub
+        WHERE sub.relname = format('%s_%s', d.relname, outbox_ident(t.target))
+          AND pg_get_partkeydef(sub.oid) LIKE format('%%outbox_shard(key, %s)%%', t.shards));
+    IF stale = 0 THEN
+      UPDATE outbox_targets SET previous_shards = NULL WHERE target = t.target;
+      RETURN NEXT t.target;
     END IF;
   END LOOP;
 END $$;
@@ -169,6 +197,7 @@ BEGIN
 END $$;
 
 SELECT outbox_create_partitions(d::date) FROM generate_series(current_date - 1, current_date + 7, '1 day') d;
+SELECT outbox_clear_previous_shards();
 
 -- One row per (target, shard). (xid, id) is the frontier: the last row published.
 -- pending holds transaction ids that were still in flight when the frontier passed
