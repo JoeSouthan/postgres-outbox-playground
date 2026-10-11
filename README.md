@@ -2,10 +2,9 @@
 
 Four ways to run a transactional outbox on Postgres, each in its own Docker Compose
 stack with its own database, driven by the same producer and measured by the same
-benchmark. The question they answer: how to keep the producer's transactional
-guarantee while getting rid of the churn a delete-based outbox table leaves behind, on
-databases where logical decoding cannot be turned on, behind PgBouncer, with
-publishers that scale by adding replicas.
+benchmark. The goal: keep the producer's transactional guarantee without the churn of
+a delete-based outbox table, on databases without logical decoding, behind PgBouncer,
+with publishers that scale by adding replicas.
 
 | strategy | one line | page |
 |---|---|---|
@@ -18,14 +17,13 @@ Measurements for all four are in [docs/benchmark.md](docs/benchmark.md).
 
 ## Requirements
 
-These are the requirements the strategies are judged against. Each strategy page ends
-with a section that takes them one by one.
+Each strategy page ends with a section that takes these one by one.
 
 | | requirement | why |
 |---|---|---|
 | **R1** | **Atomic with the business write.** An event exists if and only if the transaction that produced it committed. | This is the point of an outbox. |
 | **R2** | **Low churn.** The outbox must not create dead tuples, index bloat or vacuum pressure in proportion to traffic. | A delete-based outbox table pays a dead tuple per event, and that churn is the problem being solved. |
-| **R3** | **Simple to reason about.** Ordinary SQL, pending events visible and replayable, as few moving parts as possible. | A clever transport that nobody can debug at 3 a.m. is a net loss. |
+| **R3** | **Simple to reason about.** Ordinary SQL, pending events visible and replayable, as few moving parts as possible. | Operability. |
 | **R4** | **No logical decoding required.** Must work without `wal_level = logical` on databases that do not otherwise need it. | That setting is cluster-wide, needs a restart, and is not the outbox owner's call on a shared instance. |
 | **R5** | **Runs behind PgBouncer in transaction mode**, producer and publisher alike. | Transaction-mode pooling is the common deployment, and nothing session-scoped survives it. |
 | **R6** | **Long transactions do not stall publishing.** | Real systems have transactions that stay open for minutes; one of them must not hold back everyone else's events. |
@@ -51,10 +49,9 @@ with a section that takes them one by one.
 | R9 cannot get stuck | ✅ | ◐ | ◐ | ◐ |
 | R10 ordering | insert order | commit order | commit order | per key |
 
-The short version: `wal` and `journal` solve the churn completely but fail the two
-constraints that matter most here, no logical decoding and replica scaling. `cursor`
-meets everything the table meets except that its dead-letter path is designed and not
-yet built, and it removes the churn.
+`wal` and `journal` remove the churn but need logical decoding and cannot scale by
+replicas. `cursor` removes the churn and meets everything the table meets; its
+dead-letter path is designed and not yet built.
 
 ## Layout
 
@@ -97,9 +94,7 @@ docker compose run --rm -e RELAY_TARGET=target_2 outbox-wal &   # a second targe
 docker compose exec postgres-cursor psql -U outbox -d outbox    # poke at a database
 ```
 
-Swap `cursor` for `table`, `wal` or `journal`; each page has the walkthroughs specific
-to its strategy, such as slot-loss recovery for `journal` and multi-replica publishing
-with a held-open transaction for `cursor`.
+Swap `cursor` for `table`, `wal` or `journal`; each page has its own walkthroughs.
 
 `bench/run.sh [events] [per_txn] [workers]` (defaults 100000, 10, 32) runs every
 strategy through the same scenarios and appends one JSON line per run to
@@ -113,4 +108,4 @@ what they mean are in [docs/benchmark.md](docs/benchmark.md).
 - Whether the hosting platform preserves replication slots on a standard failover, and
   on which editions. This only matters if `wal` or `journal` is ever chosen.
 - The cursor dead-letter path is designed ([docs/cursor-dead-letters.md](docs/cursor-dead-letters.md))
-  and not yet built or benchmarked.
+  and not yet built.

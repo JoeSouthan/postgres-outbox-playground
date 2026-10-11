@@ -1,11 +1,10 @@
 # `wal`: events in the write-ahead log, no table
 
 `pg_logical_emit_message(true, target, payload)` writes the payload into the
-write-ahead log as part of the open transaction. It touches no table. A logical
-replication slot retains every log record after its confirmed position; a relay reads
-the stream over a replication connection, keeps the messages whose prefix is its
-target, publishes them in batches, and advances the slot. There is nothing to vacuum
-because nothing was written to a table.
+write-ahead log inside the open transaction and touches no table. A logical
+replication slot retains the log from its confirmed position; a relay streams it over
+a replication connection, keeps the messages whose prefix is its target, publishes in
+batches, and advances the slot.
 
 Stack: `postgres-wal` (`wal_level=logical`), `pgbouncer-wal`, `outbox-wal` (`/relay`),
 `producer-wal`. Schema: [`postgres/10-publication.sql`](../postgres/10-publication.sql),
@@ -86,9 +85,8 @@ Requirements on the database: Postgres 14+ for pgoutput messages, a role with
   itself is not.
 - **The relay must not create a slot silently in production.** The prototype does, for
   convenience. A missing slot with existing state should page someone.
-- **Thin tooling outside Go and Java.** Debezium handles these messages natively and
-  Debezium Server has a Pub/Sub sink. Go has pglogrepl. Most other CDC tools and every
-  surveyed Ruby outbox library handle row changes only.
+- **Thin tooling outside Go and Java.** Debezium handles these messages and has a
+  Pub/Sub sink; Go has pglogrepl. Most other CDC tools handle row changes only.
 
 ## Against the requirements
 
@@ -96,7 +94,7 @@ Requirements on the database: Postgres 14+ for pgoutput messages, a role with
 |---|---|---|
 | R1 atomic | ✅ | The message is a record in the transaction's own log. A rollback never produces it. |
 | R2 low churn | ✅ | Zero rows, zero dead tuples, zero index. The lightest strategy on every database axis in the benchmark: 42 MB of WAL for 100,000 events against 90 MB for the table. |
-| R3 simple | ✗ | Replication protocol, slot lifecycle, a state file, acknowledgement at commit boundaries, and a backlog nobody can `SELECT`. Far more for a team to reason over than a table. |
+| R3 simple | ✗ | Replication protocol, slot lifecycle, a state file, acknowledgement at commit boundaries, and a backlog nobody can `SELECT`. |
 | R4 no logical decoding | ✗ | Requires `wal_level = logical`, a cluster-wide setting with a restart. Disqualifying on the databases this is for. |
 | R5 PgBouncer | ◐ | The producer runs through the pooler. The relay cannot: replication connections go directly to the primary. |
 | R6 long transactions | ✅ | Logical decoding delivers a transaction at its commit, so an open transaction delays only its own events. The slot does retain log from the oldest open transaction's start, which is disk, not a stall. |

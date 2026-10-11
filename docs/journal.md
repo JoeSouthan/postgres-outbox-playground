@@ -1,10 +1,8 @@
 # `journal`: `wal` plus an append-only journal for slot loss
 
-Everything in [`wal`](wal.md), plus a safety net in the spirit of LISTEN/NOTIFY backed
-by polling: the log stream is the fast path and an append-only table is the recovery
-path. The producer writes both in one statement, storing the message's log position in
-the row. In steady state the journal is never read. It exists for one case: the relay
-comes back and its slot is gone.
+Everything in [`wal`](wal.md), plus an append-only table as the recovery path. The
+producer writes both in one statement, storing the message's log position in the row.
+The journal is read in one case only: the relay comes back and its slot is gone.
 
 Stack: `postgres-journal` (`wal_level=logical`), `pgbouncer-journal`, `outbox-journal`
 (`/relay` with `RELAY_JOURNAL=true`), `producer-journal`. Schema:
@@ -33,10 +31,9 @@ dead tuple.
 | `confirmed_flush_lsn` | the slot, in Postgres | Postgres may discard log before this; the relay advances it with a standby status update after a batch is published |
 | last acknowledged LSN | the relay's state file, `state/relay_<target>.lsn` | the relay's own copy of the same number, written atomically every time it acknowledges |
 
-In steady state the two agree. The state file exists because the slot is the thing that
-disappears in a failover, and the number it held is the only thing that defines the
-lost window. In production this file belongs on durable storage outside the database
-that just failed over.
+In steady state the two agree. The state file exists because the slot is what
+disappears in a failover, and its number defines the lost window. It belongs on durable
+storage outside the database.
 
 **What happens on start.** The relay tries to create its slot, then branches on two
 facts: did the slot already exist, and does a state file exist.
@@ -55,10 +52,10 @@ flowchart TD
   W --> T
 ```
 
-The slot-exists path is the normal restart. The created-now path with a state file is a
-failover or an operator dropping the slot: the gap between the state file's position
-and the new slot's consistent point is exactly what was committed while no slot was
-retaining log, and the journal holds it.
+The slot-exists path is a normal restart. Created-now with a state file is a failover
+or a dropped slot: the gap between the state file's position and the new slot's
+consistent point is what was committed while no slot retained log, and the journal
+holds it.
 
 **The replay itself.** Over an ordinary connection, not the replication one:
 
@@ -69,24 +66,20 @@ WHERE target = $1 AND lsn > $2::pg_lsn AND lsn <= $3::pg_lsn
 ORDER BY lsn, id;
 ```
 
-`$2` is the state file's position and `$3` the new slot's consistent point. The rows go
-through the same sink in relay-sized batches with a `replayed=true` attribute, and the
-state file is then set to the consistent point. Only after that does streaming begin,
-so a crash during replay replays again from the same position. The benchmark's
-slot-loss run replayed exactly 100,000 rows this way in 22.7 seconds.
+`$2` is the state file's position and `$3` the new slot's consistent point. Rows go
+through the same sink with a `replayed=true` attribute, then the state file is set to
+the consistent point and streaming begins; a crash during replay repeats it. The
+benchmark's slot-loss run replayed exactly 100,000 rows in 22.7 seconds.
 
-**The boundary edge.** The stored `lsn` is where the message was written, which is
-before its transaction's commit record. A transaction that wrote its message early and
-committed late can have a position below one the relay has already acknowledged, while
-still being streamed correctly in normal operation because streaming is commit-ordered.
-After a slot loss, replaying strictly from the acknowledged position would miss it.
-Widen the window downward by at least the longest transaction the producers run, and
-rely on consumer dedupe for the duplicates that creates. The prototype replays from the
-exact position; a production relay should apply the margin.
+**The boundary edge.** The stored `lsn` is where the message was written, before its
+transaction's commit record. A transaction that wrote early and committed late can
+hold a position below one already acknowledged; streaming handles it because it is
+commit-ordered, but a replay from the exact acknowledged position would miss it. A
+production relay must widen the window downward by the longest producer transaction
+and rely on consumer dedupe. The prototype replays from the exact position.
 
-**Retention is the one knob.** The journal can only recover what it still holds. Keep
-partitions for longer than the longest relay outage you intend to survive, and alert on
-journal partition age against that, the same way you alert on slot lag.
+**Retention.** The journal recovers only what it still holds. Keep partitions longer
+than the longest outage to survive, and alert on partition age against that.
 
 ## What it costs beyond `wal`
 

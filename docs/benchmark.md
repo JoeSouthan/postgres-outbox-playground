@@ -1,9 +1,9 @@
 # Benchmark: table outbox vs log messages vs append-only table with a cursor
 
 The same producer workload driven through four transports, measuring the effect on the
-producer, on the relay and on the database. Numbers are from one laptop-class machine
-with every component sharing the same virtual machine, so the ratios between transports
-matter more than the absolute figures.
+producer, the relay and the database. Numbers are from one laptop with every component
+in one virtual machine; ratios between transports matter more than absolute figures,
+and the caveats at the end say which figures are stable.
 
 ## Environment
 
@@ -16,10 +16,8 @@ matter more than the absolute figures.
 | PgBouncer | edoburu/pgbouncer, transaction mode, pool of 64 server connections, one per Postgres |
 | Sink | simulated: every publish batch costs 200 ms and sends nothing, standing in for a Pub/Sub round trip |
 
-Postgres, PgBouncer, the relay and the producer all run inside that one VM and compete
-for the same four physical cores. Only one transport's stack is busy at a time; the
-other three databases sit idle. There is no network between them beyond the Docker
-bridge.
+Everything shares the VM's four physical cores. One transport's stack is busy at a
+time.
 
 ## Method
 
@@ -230,9 +228,8 @@ Eight concurrent workers divide that floor by eight.
 
 ## Findings
 
-**Headline comparison.** Treat producer differences under about 15 percent as noise:
-across runs the same producer workload varied by that much on the same transport for
-no physical reason. The relay-side and physical-state numbers are far more stable.
+**Headline comparison.** Physical-state and backlog figures are stable across reruns;
+concurrent-scenario figures are indicative only (see Caveats).
 
 | | table | wal | journal | cursor, 1 stream | cursor, 8 workers | cursor, 8 × 2 replicas |
 |---|---|---|---|---|---|---|
@@ -278,13 +275,11 @@ no physical reason. The relay-side and physical-state numbers are far more stabl
    never give back without a REINDEX, on a table that was empty again. The journal's
    index sat at 91 percent leaf density with nothing deleted. The cursor's per-shard
    leaf indexes ended at 88 percent density, zero fragmentation and nothing deleted,
-   6.4 MB against the journal's 4.1 MB for the same rows. An earlier layout with one
-   `(target, shard, xid, id)` index per day partition measured 52 percent density and
-   8.8 MB, because 32 shards meant 32 interleaved insertion points and 50/50 page
-   splits; partitioning each target by shard turned every insert back into a right-edge
-   append. The cursor heaps end with 15 to 19 percent free space rather than the
-   journal's 3, from 32 producer connections extending 32 small relations concurrently;
-   that room is filled by later inserts and is not dead space.
+   6.4 MB against the journal's 4.1 MB for the same rows. With one `(target, shard,
+   xid, id)` index per day instead of per-shard leaves, the same rows measured 52
+   percent density and 8.8 MB, from 32 interleaved insertion points. The cursor heaps
+   end with 15 to 19 percent free space, from 32 producer connections extending 32
+   small relations concurrently; later inserts fill it.
 
 4. **Replicas scale publishing and lose nothing.** The 100,000-event backlog that one
    cursor stream drains in 29.5 seconds drains in 6.7 seconds with eight workers
@@ -308,16 +303,15 @@ no physical reason. The relay-side and physical-state numbers are far more stabl
 6. **Producer cost for `cursor` is in the table and journal band, measured per
    statement.** With the relay stopped, the two producer statements cost 358 to 622
    ms per 1,000 events on `cursor` across three identical-code runs, 625 on `table`,
-   645 on `journal` and 435 on `wal`; the spread on `cursor` is host noise, and routing
-   each row through the day, target and shard partitions sits inside the table's own
-   band rather than above it. Under concurrent load every producer gets slower because the relay competes
-   for the same four cores, and the table relay competes hardest.
+   645 on `journal` and 435 on `wal`. The spread on `cursor` is host noise; partition
+   routing does not put it above the table. Under concurrent load every producer slows
+   because the relay competes for the same cores, and the table relay competes hardest.
 
-7. **`wal` is still the lightest transport on every database axis and `journal` still
-   recovers a lost slot**, replaying exactly 100,000 rows in 22.7 seconds. Their
-   database work is invisible to pg_stat_statements because a replication stream is
-   not a statement, which is itself a point: there is no query to tune. Their price is
-   `wal_level=logical`, a slot per target and one stream per slot.
+7. **`wal` is the lightest transport on every database axis and `journal` recovers a
+   lost slot**, replaying exactly 100,000 rows in 22.7 seconds. Their database work
+   does not appear in pg_stat_statements because a replication stream is not a
+   statement. Their price is `wal_level=logical`, a slot per target and one stream per
+   slot.
 
 **What this means for the decision.** If logical decoding is available, `wal` or
 `journal` is the lightest way to stop an outbox table from bloating. If it is not,
@@ -328,29 +322,20 @@ are transaction-id order instead of commit order, a partition tree to create and
 on a schedule, and a per-poll planning cost that grows with the number of days
 retained.
 
-## Four things the harness taught us before any numbers
+## Harness notes
 
-- **The usual table-outbox claim is fragile.** Written as `DELETE … WHERE id IN (SELECT
-  … LIMIT 1000 FOR UPDATE SKIP LOCKED)`, the planner can choose to rescan the subquery
-  per candidate row once statistics are stale after a bulk load. On this stack that
-  turned a 1,000-row claim into minutes of a saturated core and a claim that returned
-  more rows than its LIMIT. Writing the claim as `WITH claimed AS MATERIALIZED (…)
-  DELETE … USING claimed` evaluates it exactly once. Production table relays should
-  use that form.
-- **The Pub/Sub emulator is not a benchmark target.** Its single Java process became the
-  bottleneck at a few hundred messages per second with ordering keys and retained
-  memory across runs, so publish throughput said nothing about the transports. The
-  relays got a simulated sink with a fixed cost per batch instead, and the emulator was
-  removed from the stack.
-- **Concurrent workers log out of order.** The cursor relay's `total=` counter is
-  monotonic but eight goroutines write the log, so the last line is not the largest
-  value. The harness takes the maximum per replica and sums across replicas.
-- **Stale replica logs lie.** Summing per-replica logs by glob meant a one-replica run
-  that followed a two-replica run also counted the old second log, declared itself
-  drained at half the events, and reported an impossible 18-second drain for one
-  worker publishing 269 batches at 200 ms each. The harness now clears a run's replica
-  logs before starting it, and a drain shorter than batches × sink latency is the
-  smell to look for.
+- **Table claim form.** `DELETE … WHERE id IN (SELECT … LIMIT 1000 FOR UPDATE SKIP
+  LOCKED)` can be rescanned per candidate row when statistics are stale, which turned
+  a 1,000-row claim into minutes of CPU here. The harness and the table page use
+  `WITH claimed AS MATERIALIZED (…) DELETE … USING claimed`.
+- **No Pub/Sub emulator.** Its single Java process capped at a few hundred messages per
+  second with ordering keys. The relays use a simulated sink with a fixed cost per
+  batch.
+- **Out-of-order logs.** The cursor relay's `total=` counter is monotonic but workers log
+  concurrently; the harness takes the maximum per replica and sums replicas.
+- **Stale replica logs.** The harness clears a run's per-replica logs before starting
+  it. A one-replica run that read a stale second log once reported a drain shorter than
+  batches × sink latency, which is the check for this.
 
 ## Caveats
 

@@ -115,8 +115,8 @@ END $$;
 -- shard s + k*old covers a subset of old shard s's keys, so it inherits that cursor
 -- exactly: nothing is republished and nothing is missed. Future day partitions that are
 -- still empty are rebuilt with the new count; today's keeps the old modulus until it
--- ages out, during which polls on it are correct but not pruned to one leaf. Restart
--- the target's publishers afterwards so they poll the new shards.
+-- ages out; the relay's two-modulus predicate keeps polls on it pruned to one leaf.
+-- Publishers pick the change up on their next refresh of outbox_targets.
 CREATE FUNCTION outbox_reshard(p_target text, p_shards int) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE old int; r record; n bigint;

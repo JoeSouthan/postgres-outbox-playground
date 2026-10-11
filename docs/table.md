@@ -1,8 +1,8 @@
 # `table`: the conventional outbox
 
 Insert a row in the business transaction; a relay claims a batch, publishes it, deletes
-the rows, commits. It is the baseline every other strategy is measured against. It is the right design for atomicity and
-at-least-once delivery; its one problem is what the deletes do to the table.
+the rows, commits. It is the baseline. It is correct for atomicity and at-least-once
+delivery; its problem is what the deletes do to the table.
 
 Stack: `postgres-table`, `pgbouncer-table`, `outbox-table` (`/tablerelay`),
 `producer-table`. Schema: [`postgres/10-table.sql`](../postgres/10-table.sql).
@@ -32,22 +32,19 @@ It publishes the returned rows and commits. A crash before commit rolls the dele
 and the rows are claimed again. `SKIP LOCKED` lets several relays claim disjoint
 batches from the same table.
 
-**Write the claim as a materialised CTE.** The usual form, `DELETE … WHERE id IN
-(SELECT … LIMIT 1000 FOR UPDATE SKIP LOCKED)`, lets the planner rescan the subquery per
-candidate row once statistics are stale after a bulk load. On this stack that turned a
-1,000-row claim into minutes of a saturated core and a claim that returned more rows
-than its LIMIT. The materialised form evaluates it exactly once.
+The claim is a materialised CTE on purpose. The form `DELETE … WHERE id IN (SELECT …
+LIMIT 1000 FOR UPDATE SKIP LOCKED)` lets the planner rescan the subquery per candidate
+row when statistics are stale, which on this stack turned a 1,000-row claim into
+minutes of CPU and returned more rows than the LIMIT.
 
 ## Where the churn comes from
 
 Every event is one INSERT and one DELETE, so every event leaves a dead tuple and dead
-index entries behind. Vacuum removes them eventually, but under bursty load it falls
-behind: the relay's claim walks over thousands of dead entries, the index grows, and
-the table needs aggressive autovacuum settings and periodic reindexing to hold steady.
-The write pattern is already minimal, so no change to the relay query fixes this. The
-only way to remove the churn is to stop deleting rows.
+index entries. Under bursty load vacuum falls behind, the claim walks dead entries, the
+index grows, and the table needs aggressive autovacuum and periodic reindexing. No
+relay query change fixes this; only not deleting does.
 
-The benchmark shows all of it on one 100,000-event run:
+One 100,000-event benchmark run:
 
 | | |
 |---|---|
@@ -60,9 +57,9 @@ The benchmark shows all of it on one 100,000-event run:
 | relay buffers touched per 1,000 events | about 9,200 |
 | relay WAL written per event, for the delete alone | 292 bytes |
 
-The 48× gap between the claim under load and the claim at rest is the relay locking
-and deleting the same pages the producers are inserting into. Every other strategy
-here ended the same run with zero dead space.
+The 48× gap between the claim under load and at rest is the relay locking and deleting
+the pages the producers are inserting into. Every other strategy ended the same run
+with zero dead space.
 
 ## Against the requirements
 
@@ -81,10 +78,8 @@ here ended the same run with zero dead space.
 
 ## Before production
 
-The strategy is well understood, so the list is what the benchmark says to check
-rather than what to build: autovacuum settings on `outbox_items` far more aggressive than the
-defaults, a scheduled REINDEX or `pg_repack`, the materialised-CTE claim, and an alarm
-on dead tuples and index size.
+Aggressive autovacuum settings on `outbox_items`, a scheduled REINDEX or `pg_repack`,
+the materialised-CTE claim, and alarms on dead tuples and index size.
 
 ## Run it
 
