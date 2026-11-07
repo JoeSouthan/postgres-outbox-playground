@@ -229,7 +229,7 @@ Run every DDL with a `lock_timeout` and a retry.
 | R9 cannot get stuck | ◐ | Designed, not built. Until the dead-letter path exists a permanently rejected message freezes its shard. |
 | R10 ordering | per key | Transaction-id order; per-key order in the normal case. Commit order given up. |
 
-## Before production
+## Before real use
 
 - Build the dead-letter path.
 - Schedule `outbox_create_partitions`, `outbox_clear_previous_shards` and the retention

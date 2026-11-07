@@ -80,10 +80,10 @@ def main():
         cursor_labels = sorted({k[0] for k in g if k[0].startswith("cursor")},
                                key=lambda l: tuple(int(x) for x in l[len("cursor w"):].split("x")))
         wanted = [("table", "concurrent"), ("wal", "concurrent"), ("journal", "concurrent")]
-        wanted += [(c, "concurrent") for c in cursor_labels]
+        wanted += [(c, "concurrent") for c in cursor_labels] + [("debezium", "concurrent")]
         wanted += [("table", "backlog"), ("wal", "backlog"), ("journal", "backlog")]
-        wanted += [(c, "backlog") for c in cursor_labels]
-        wanted += [("journal", "slotloss")] + [(c, "longtxn") for c in cursor_labels]
+        wanted += [(c, "backlog") for c in cursor_labels] + [("debezium", "backlog")]
+        wanted += [("journal", "slotloss")] + [(c, "longtxn") for c in cursor_labels] + [("debezium", "longtxn")]
         order = [k for k in wanted if k in g]
         n = {k: len(v) for k, v in g.items()}
         ev = rows[0]["events"]

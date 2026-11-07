@@ -70,7 +70,7 @@ Requirements on the database: Postgres 14+ for pgoutput messages, a role with
   on disk headroom.
 - **Slot loss on failover.** Logical slots live on the primary. A standby that shares
   the primary's disk carries the slot; a streaming replica does not. Postgres 17 adds
-  failover slots where the platform supports them; before that, `pg_failover_slots`
+  failover slots where the host supports them; before that, `pg_failover_slots`
   where extensions can be installed. Where neither applies, the window between the
   last acknowledgement and the failover is lost. The [`journal`](journal.md) strategy
   exists to recover exactly that window.
@@ -83,7 +83,7 @@ Requirements on the database: Postgres 14+ for pgoutput messages, a role with
 - **The bytes are still written.** The payload goes into the log, which is fsynced,
   physically replicated and archived. Heap, index and vacuum costs are gone; the write
   itself is not.
-- **The relay must not create a slot silently in production.** The prototype does, for
+- **The relay must not create a slot silently in real use.** The prototype does, for
   convenience. A missing slot with existing state should page someone.
 - **Thin tooling outside Go and Java.** Debezium handles these messages and has a
   Pub/Sub sink; Go has pglogrepl. Most other CDC tools handle row changes only.

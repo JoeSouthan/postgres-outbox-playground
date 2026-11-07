@@ -1,13 +1,14 @@
 # One stack per transport, so each strategy runs against its own database with only
-# what it needs: `table` and `cursor` run a plain Postgres, `wal` and `journal` run one
-# with wal_level=logical. Every stack is postgres-<mode> + pgbouncer-<mode> (transaction
-# mode) + outbox-<mode> (the publisher) + producer-<mode>. Nothing is published on host ports.
+# what it needs: `table` and `cursor` run a plain Postgres, `wal`, `journal` and
+# `debezium` run one with wal_level=logical. Every stack is postgres-<mode> +
+# pgbouncer-<mode> (transaction mode) + outbox-<mode> (the publisher) + producer-<mode>;
+# `debezium` adds sink-debezium, its simulated Pub/Sub. Nothing is published on host ports.
 #
 # There is no Pub/Sub emulator: the relays default to a simulated sink that costs a fixed
 # latency per publish batch, and can publish to a real Pub/Sub project when configured
 # (RELAY_SINK=pubsub, PUBSUB_PROJECT_ID, GOOGLE_APPLICATION_CREDENTIALS).
 #
-#   docker compose up -d                           # the four databases and their poolers
+#   docker compose up -d                           # the five databases and their poolers
 #   docker compose --profile bench build           # relay, producer and consumer images
 #   docker compose run --rm outbox-cursor &         # the publisher for one strategy ...
 #   docker compose run --rm producer-cursor -events 10000 -workers 16   # ... and its load
@@ -183,6 +184,42 @@ services:
     <<: *producer
     environment: { PRODUCER_DSN: "postgres://outbox:outbox@pgbouncer-cursor:5432/outbox", OUTBOX_MODE: cursor, OUTBOX_TARGETS: target_1 }
     depends_on: [pgbouncer-cursor]
+
+  # ---- debezium: append-only table decoded from the log by Debezium Server ----------
+  postgres-debezium:
+    <<: *postgres
+    command: *postgres_logical_command
+    volumes:
+      - ./postgres/00-common.sql:/docker-entrypoint-initdb.d/00-common.sql:ro
+      - ./postgres/10-debezium.sql:/docker-entrypoint-initdb.d/10-debezium.sql:ro
+  pgbouncer-debezium:
+    <<: *pgbouncer
+    environment: { <<: *pgbouncer_env, DB_HOST: postgres-debezium }
+    depends_on: { postgres-debezium: { condition: service_healthy } }
+  # The publisher is Debezium Server itself: configuration in debezium/application.properties,
+  # offsets on the state volume. Replication connections go to Postgres directly, never
+  # through the pooler. For a real Pub/Sub project set DEBEZIUM_SINK_TYPE=pubsub,
+  # DEBEZIUM_SINK_PUBSUB_PROJECT_ID and mount credentials.
+  outbox-debezium:
+    image: quay.io/debezium/server:latest
+    profiles: [bench]
+    volumes:
+      - ./debezium/application.properties:/debezium/config/application.properties:ro
+      - ./state/debezium:/debezium/data
+    depends_on:
+      postgres-debezium: { condition: service_healthy }
+      sink-debezium: { condition: service_started }
+  # Simulated Pub/Sub for Debezium's HTTP sink: counts events, costs RELAY_SINK_LATENCY
+  # per batch, sends nothing.
+  sink-debezium:
+    build: ./relay
+    profiles: [bench]
+    command: ["/httpsink"]
+    environment: { RELAY_SINK_LATENCY: 200ms }
+  producer-debezium:
+    <<: *producer
+    environment: { PRODUCER_DSN: "postgres://outbox:outbox@pgbouncer-debezium:5432/outbox", OUTBOX_MODE: debezium, OUTBOX_TARGETS: target_1 }
+    depends_on: [pgbouncer-debezium]
 
   # Only useful against a real Pub/Sub project (there is no emulator in this stack):
   # set PUBSUB_PROJECT_ID and mount credentials.

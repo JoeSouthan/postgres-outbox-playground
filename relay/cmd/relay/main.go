@@ -113,8 +113,8 @@ func run(ctx context.Context, cfg config) error {
 	}
 	published := 0
 	if created && hasState {
-		// The slot is gone but we know where we got to. Everything committed between
-		// lastAcked and the new slot's consistent point was never streamed to us.
+		// The slot is gone but the state file says where the relay got to. Everything committed between
+		// lastAcked and the new slot's consistent point was never streamed.
 		if !cfg.journal {
 			log.Printf("WARNING slot %s was missing; last acknowledged %s, new slot starts at %s: events in that window are lost (no -journal)", cfg.slot, lastAcked, startLSN)
 		} else {
@@ -144,14 +144,14 @@ func run(ctx context.Context, cfg config) error {
 
 	p := &pending{ackLSN: startLSN}
 	var (
-		confirmed  = startLSN // last LSN we told Postgres it may discard
+		confirmed  = startLSN // last LSN Postgres was told it may discard
 		nextStatus = time.Now().Add(cfg.statusEvery)
 		nextFlush  = time.Now().Add(cfg.flushEvery)
 		currentXid uint32 // xid of the transaction being decoded, from its BEGIN
 	)
 	if created {
 		// A fresh slot: nothing before its consistent point can ever be streamed, so
-		// that is our acknowledged position from now on.
+		// that is the acknowledged position from now on.
 		writeState(cfg.stateFile, startLSN)
 	}
 
@@ -267,7 +267,7 @@ func toPubsub(m *pglogrepl.LogicalDecodingMessageV2, lsn pglogrepl.LSN, xid uint
 		"target":           m.Prefix,
 		"pg_transactional": fmt.Sprint(m.Transactional),
 	}
-	// If the payload is a JSON object with a "type" or "key" we surface them as
+	// If the payload is a JSON object with a "type" or "key" they are surfaced as
 	// attributes so subscribers can filter or order without decoding the body.
 	var probe struct {
 		Type string `json:"type"`
@@ -391,7 +391,7 @@ func ensureSlot(ctx context.Context, conn *pgconn.PgConn, slot string) (pglogrep
 // Note that lsn is where the message was written, not where its transaction
 // committed; a long transaction can commit after a higher position was acknowledged.
 // The window is therefore widened by one status interval's worth of positions on the
-// low side in production, and consumers dedupe on the message id regardless.
+// low side in real use, and consumers dedupe on the message id regardless.
 func replayJournal(ctx context.Context, cfg config, topic sink, from, to pglogrepl.LSN) (int, error) {
 	conn, err := pgx.Connect(ctx, cfg.journalDSN)
 	if err != nil {

@@ -4,7 +4,7 @@
 # script only drives docker compose from the host.
 #
 #   bench/run.sh [events] [per_txn] [workers]       defaults 100000 10 32
-#   BENCH_MODES="table wal journal cursor" BENCH_SCENARIOS="concurrent backlog" to narrow
+#   BENCH_MODES="table wal journal cursor debezium" BENCH_SCENARIOS="concurrent backlog" to narrow
 #   BENCH_CURSOR_WORKERS=8 BENCH_CURSOR_REPLICAS=1   cursor relay: pollers per replica,
 #                                                   and how many relay containers to run
 #
@@ -13,13 +13,15 @@
 #   backlog     producer runs with the relay stopped, then the relay drains (burst)
 #   slotloss    (journal only) producer runs with the relay stopped, the slot is dropped
 #               to simulate a failover, the relay restarts and recovers from the journal
-#   longtxn     (cursor only) as concurrent, but a transaction that wrote one event is
-#               held open for BENCH_LONGTXN_S (default 30) seconds across the whole run;
-#               drain must not wait for it, and its event must arrive after it commits
+#   longtxn     (cursor and debezium) as concurrent, but a transaction that wrote one
+#               event is held open for BENCH_LONGTXN_S (default 30) seconds across the
+#               whole run; drain must not wait for it, and its event must arrive after
+#               it commits
 #
 # Each transport has its own stack: postgres-<mode>, pgbouncer-<mode>, outbox-<mode>
-# (the publisher) and producer-<mode>. Requires `docker compose up -d` and
-# `docker compose --profile bench build`.
+# (the publisher) and producer-<mode>; debezium adds sink-debezium, the counter that
+# Debezium Server publishes to, whose log is the one the harness reads. Requires
+# `docker compose up -d` and `docker compose --profile bench build`.
 # One JSON line per run is appended to bench/results.jsonl; logs go to bench/logs/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -27,7 +29,7 @@ cd "$(dirname "$0")/.."
 EVENTS=${1:-100000}
 PER_TXN=${2:-10}
 WORKERS=${3:-32}
-MODES=${BENCH_MODES:-"table wal journal cursor"}
+MODES=${BENCH_MODES:-"table wal journal cursor debezium"}
 SCENARIOS=${BENCH_SCENARIOS:-"concurrent backlog slotloss longtxn"}
 CURSOR_WORKERS=${BENCH_CURSOR_WORKERS:-8}
 CURSOR_REPLICAS=${BENCH_CURSOR_REPLICAS:-1}
@@ -40,13 +42,13 @@ SINK_LATENCY=${BENCH_SINK_LATENCY:-200ms}
 RELAY_CONTAINER=outbox-bench-relay
 TARGET=target_1
 SLOT="outbox_relay_$TARGET"
-mkdir -p "$LOGDIR" state/wal state/journal
+mkdir -p "$LOGDIR" state/wal state/journal state/debezium
 
 RELAY_PID=""; RELAY_PIDS=(); SAMPLER_PID=""
 MODE=""   # the transport of the current run; selects the stack every helper talks to
 sql() { docker compose exec -T "postgres-$MODE" psql -U outbox -d outbox -Atq -c "$1"; }
 
-outbox_table() { case "$1" in table) echo outbox_items;; journal) echo outbox_journal;; cursor) echo outbox_events;; *) echo outbox_items;; esac; }
+outbox_table() { case "$1" in table) echo outbox_items;; journal) echo outbox_journal;; cursor|debezium) echo outbox_events;; *) echo outbox_items;; esac; }
 
 # Size of a table including partitions and indexes (pg_total_relation_size of a
 # partitioned parent is 0), and of its indexes alone.
@@ -60,6 +62,7 @@ reset_db() { # resets the current mode's database
     journal) sql "TRUNCATE outbox_journal, payments" >/dev/null; sql "VACUUM ANALYZE outbox_journal" >/dev/null ;;
     cursor)  sql "TRUNCATE outbox_events, payments" >/dev/null; sql "DELETE FROM outbox_cursor" >/dev/null
              sql "VACUUM ANALYZE outbox_events" >/dev/null; sql "VACUUM ANALYZE outbox_cursor" >/dev/null ;;
+    debezium) sql "TRUNCATE outbox_events, payments" >/dev/null; sql "VACUUM ANALYZE outbox_events" >/dev/null ;;
   esac
   sql "VACUUM ANALYZE payments" >/dev/null
   sql "SELECT pg_stat_reset()" >/dev/null
@@ -70,6 +73,10 @@ reset_db() { # resets the current mode's database
     # really creates one (and writes the state file the slot-loss scenario relies on).
     sql "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active" >/dev/null
     rm -f "state/$MODE"/relay_*.lsn
+  fi
+  if [ "$MODE" = debezium ]; then   # fresh slot and no offsets, as above
+    sql "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active" >/dev/null
+    rm -f state/debezium/offsets.dat
   fi
 }
 
@@ -91,6 +98,19 @@ start_relay() { # mode logfile  (cursor: one container per replica, logfile.rN.l
     RELAY_PID=${RELAY_PIDS[0]}
     return
   fi
+  if [ "$1" = debezium ]; then
+    # Two containers: the counter sink, whose log carries total=, and Debezium Server,
+    # logged beside it. Ready when the sink listens and the slot is active.
+    docker rm -f "$RELAY_CONTAINER-sink" >/dev/null 2>&1 || true
+    docker compose run --rm -T --name "$RELAY_CONTAINER-sink" --no-deps --use-aliases -e RELAY_SINK_LATENCY="$SINK_LATENCY" sink-debezium > "$2" 2>&1 &
+    RELAY_PIDS+=($!)
+    for _ in $(seq 1 100); do grep -q -a 'relaying' "$2" 2>/dev/null && break; sleep 0.2; done
+    docker compose run --rm -T --name "$RELAY_CONTAINER" --no-deps outbox-debezium > "${2%.log}.server.log" 2>&1 &
+    RELAY_PID=$!
+    RELAY_PIDS+=($!)
+    for _ in $(seq 1 300); do [ "$(sql "SELECT count(*) FROM pg_replication_slots WHERE active" 2>/dev/null)" = 1 ] && break; sleep 0.2; done
+    return
+  fi
   docker compose run --rm -T --name "$RELAY_CONTAINER" "${se[@]}" "outbox-$1" > "$2" 2>&1 &
   RELAY_PID=$!
   for _ in $(seq 1 100); do grep -q -a -E 'streaming|relaying' "$2" 2>/dev/null && break; sleep 0.2; done
@@ -98,7 +118,8 @@ start_relay() { # mode logfile  (cursor: one container per replica, logfile.rN.l
 
 stop_relay() {
   if [ -n "${RELAY_PID:-}" ]; then
-    docker stop -t 5 "$RELAY_CONTAINER" >/dev/null 2>&1 || true
+    docker stop -t 20 "$RELAY_CONTAINER" >/dev/null 2>&1 || true
+    docker stop -t 5 "$RELAY_CONTAINER-sink" >/dev/null 2>&1 || true
     for i in $(seq 1 "$CURSOR_REPLICAS"); do docker stop -t 5 "$RELAY_CONTAINER-$i" >/dev/null 2>&1 || true; done
     for p in "${RELAY_PIDS[@]:-$RELAY_PID}"; do kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
     RELAY_PID=""; RELAY_PIDS=()
@@ -308,7 +329,7 @@ PY
 for mode in $MODES; do
   for scenario in $SCENARIOS; do
     if [ "$scenario" = slotloss ] && [ "$mode" != journal ]; then continue; fi
-    if [ "$scenario" = longtxn ] && [ "$mode" != cursor ]; then continue; fi
+    if [ "$scenario" = longtxn ] && [ "$mode" != cursor ] && [ "$mode" != debezium ]; then continue; fi
     run_one "$mode" "$scenario" | tee -a bench/results.jsonl
   done
 done

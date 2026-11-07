@@ -9,7 +9,7 @@ of the [cursor transport](cursor.md).
 
 A delete-based relay can set a row aside and carry on. The cursor relay's only durable
 state is the frontier, which can only move past a row once that row is accounted for.
-Today a publish error rolls the poll back, which is right for a broker outage and wrong
+As built, a publish error rolls the poll back, which is right for a broker outage and wrong
 for a deterministic rejection: the same batch fails on every retry and that shard
 stops. The design adds a second place a row can be accounted for, a table in the same
 database written in the same transaction that advances the cursor.

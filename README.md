@@ -1,6 +1,6 @@
 # postgres-outbox-playground
 
-Four ways to run a transactional outbox on Postgres, each in its own Docker Compose
+Five ways to run a transactional outbox on Postgres, each in its own Docker Compose
 stack with its own database, driven by the same producer and measured by the same
 benchmark. The goal: keep the producer's transactional guarantee without the churn of
 a delete-based outbox table, on databases without logical decoding, behind PgBouncer,
@@ -12,8 +12,9 @@ with publishers that scale by adding replicas.
 | `wal` | No table. `pg_logical_emit_message` writes the event into the write-ahead log; a relay decodes it from a replication slot. | [docs/wal.md](docs/wal.md) |
 | `journal` | `wal` plus an append-only journal table so a relay can recover a lost slot. | [docs/journal.md](docs/journal.md) |
 | `cursor` | Append-only partitioned table read forward by per-shard cursors. No slot, no deletes, any number of replicas, through PgBouncer. | [docs/cursor.md](docs/cursor.md) |
+| `debezium` | The same append-only table, with no index and nothing reading it; Debezium Server decodes the inserts from the log and routes them with its Outbox Event Router. | [docs/debezium.md](docs/debezium.md) |
 
-Measurements for all four are in [docs/benchmark.md](docs/benchmark.md).
+Measurements for all five are in [docs/benchmark.md](docs/benchmark.md).
 
 ## Requirements
 
@@ -36,34 +37,38 @@ Each strategy page ends with a section that takes these one by one.
 
 ✅ met · ◐ met with caveats, see the page · ✗ not met
 
-| | `table` | `wal` | `journal` | `cursor` |
-|---|---|---|---|---|
-| R1 atomic | ✅ | ✅ | ✅ | ✅ |
-| R2 low churn | ✗ | ✅ | ✅ | ✅ |
-| R3 simple | ✅ | ✗ | ✗ | ◐ |
-| R4 no logical decoding | ✅ | ✗ | ✗ | ✅ |
-| R5 PgBouncer | ✅ | ◐ | ◐ | ✅ |
-| R6 long transactions | ✅ | ✅ | ✅ | ✅ |
-| R7 deployment per target, replicas | ◐ | ✗ | ✗ | ✅ |
-| R8 at-least-once, never lose | ✅ | ✗ | ✅ | ✅ |
-| R9 cannot get stuck | ✅ | ◐ | ◐ | ◐ |
-| R10 ordering | insert order | commit order | commit order | per key |
+| | `table` | `wal` | `journal` | `cursor` | `debezium` |
+|---|---|---|---|---|---|
+| R1 atomic | ✅ | ✅ | ✅ | ✅ | ✅ |
+| R2 low churn | ✗ | ✅ | ✅ | ✅ | ✅ |
+| R3 simple | ✅ | ✗ | ✗ | ◐ | ◐ |
+| R4 no logical decoding | ✅ | ✗ | ✗ | ✅ | ✗ |
+| R5 PgBouncer | ✅ | ◐ | ◐ | ✅ | ◐ |
+| R6 long transactions | ✅ | ✅ | ✅ | ✅ | ✅ |
+| R7 deployment per target, replicas | ◐ | ✗ | ✗ | ✅ | ✗ |
+| R8 at-least-once, never lose | ✅ | ✗ | ✅ | ✅ | ◐ |
+| R9 cannot get stuck | ✅ | ◐ | ◐ | ◐ | ◐ |
+| R10 ordering | insert order | commit order | commit order | per key | commit order |
 
 `wal` and `journal` remove the churn but need logical decoding and cannot scale by
 replicas. `cursor` removes the churn and meets everything the table meets; its
-dead-letter path is designed and not yet built.
+dead-letter path is designed and not yet built. `debezium` is the lightest table of
+all and needs no relay code, at the price of logical decoding, a singleton publisher
+and a slot whose loss skips a window; where logical decoding is available anyway it is
+the cursor's main alternative.
 
 ## Layout
 
 | path | what |
 |---|---|
-| `docker-compose.yml` | one stack per strategy: `postgres-<mode>` (Postgres 18, `wal_level=logical` only for `wal` and `journal`), `pgbouncer-<mode>` (transaction mode), `outbox-<mode>` (the publisher) and `producer-<mode>`; no host ports, no Pub/Sub emulator |
-| `postgres/*.sql` | per-strategy schema mounted into each database's init directory: `00-common.sql` (`payments`), `10-table.sql`, `10-publication.sql`, `20-journal.sql`, `10-cursor.sql` |
-| `relay/` | Go: `/tablerelay`, `/relay` (slot streaming, with `-journal` recovery) and `/cursorrelay`; one shared sink package that publishes to Pub/Sub or to a simulated sink |
-| `producer/` | Go load generator: worker pool, pipelined transactions, all four modes, latency percentiles |
+| `docker-compose.yml` | one stack per strategy: `postgres-<mode>` (Postgres 18, `wal_level=logical` only for `wal`, `journal` and `debezium`), `pgbouncer-<mode>` (transaction mode), `outbox-<mode>` (the publisher) and `producer-<mode>`; `debezium` adds `sink-debezium`; no host ports, no Pub/Sub emulator |
+| `postgres/*.sql` | per-strategy schema mounted into each database's init directory: `00-common.sql` (`payments`), `10-table.sql`, `10-publication.sql`, `20-journal.sql`, `10-cursor.sql`, `10-debezium.sql` |
+| `debezium/` | Debezium Server configuration: source, Outbox Event Router, offset store, HTTP and Pub/Sub sinks |
+| `relay/` | Go: `/tablerelay`, `/relay` (slot streaming, with `-journal` recovery), `/cursorrelay` and `/httpsink` (the counter Debezium's HTTP sink posts to); one shared sink package that publishes to Pub/Sub or to a simulated sink |
+| `producer/` | Go load generator: worker pool, pipelined transactions, all five modes, latency percentiles |
 | `consumer/` | Go: subscribes to a target's topic on a real Pub/Sub project and prints what arrives |
 | `bench/` | `run.sh` drives the benchmark, `report.py` renders `results.jsonl` into the tables in [docs/benchmark.md](docs/benchmark.md) |
-| `docs/` | one page per strategy, the dead-letter design for `cursor`, and the benchmark |
+| `docs/` | one page per strategy, the dead-letter designs for `cursor` and `debezium`, and the benchmark |
 
 Every event carries a **target**. One publisher serves one target and publishes to that
 target's topic; adding a destination is adding a publisher. `mise.toml` pins Go for
@@ -76,13 +81,15 @@ bottleneck at a few hundred messages per second with ordering keys. Every publis
 two sinks. `simulated` (the default) costs `RELAY_SINK_LATENCY` per publish batch,
 200 ms by default, and sends nothing; it stands in for a Pub/Sub round trip. `pubsub`
 publishes to a real project: set `RELAY_SINK=pubsub`, `PUBSUB_PROJECT_ID`, and mount
-credentials via `GOOGLE_APPLICATION_CREDENTIALS`. The consumer only works with the real
+credentials via `GOOGLE_APPLICATION_CREDENTIALS`. Debezium Server's equivalents are
+its HTTP sink posting to `sink-debezium`, which charges the same latency per batch, and
+its own Pub/Sub sink (`DEBEZIUM_SINK_TYPE=pubsub`). The consumer only works with a real
 sink.
 
 ## Run it
 
 ```sh
-docker compose up -d                                  # the four databases and their poolers
+docker compose up -d                                  # the five databases and their poolers
 docker compose --profile bench build                  # publisher, producer and consumer images
 
 docker compose run --rm outbox-cursor &               # a publisher for target_1 ...
@@ -94,7 +101,8 @@ docker compose run --rm -e RELAY_TARGET=target_2 outbox-wal &   # a second targe
 docker compose exec postgres-cursor psql -U outbox -d outbox    # poke at a database
 ```
 
-Swap `cursor` for `table`, `wal` or `journal`; each page has its own walkthroughs.
+Swap `cursor` for `table`, `wal`, `journal` or `debezium`; each page has its own
+walkthroughs.
 
 `bench/run.sh [events] [per_txn] [workers]` (defaults 100000, 10, 32) runs every
 strategy through the same scenarios and appends one JSON line per run to
@@ -105,7 +113,8 @@ what they mean are in [docs/benchmark.md](docs/benchmark.md).
 
 - Write-ahead log volume per event under representative payloads and real settings,
   beyond what the benchmark measures with the simulated sink.
-- Whether the hosting platform preserves replication slots on a standard failover, and
-  on which editions. This only matters if `wal` or `journal` is ever chosen.
-- The cursor dead-letter path is designed ([docs/cursor-dead-letters.md](docs/cursor-dead-letters.md))
-  and not yet built.
+- Whether a managed Postgres service preserves replication slots on a standard
+  failover. This only matters if `wal`, `journal` or `debezium` is ever chosen.
+- The dead-letter paths for `cursor` ([docs/cursor-dead-letters.md](docs/cursor-dead-letters.md))
+  and `debezium` ([docs/debezium-dead-letters.md](docs/debezium-dead-letters.md)) are
+  designed and not yet built.

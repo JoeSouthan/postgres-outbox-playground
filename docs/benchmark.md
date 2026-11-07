@@ -1,6 +1,6 @@
-# Benchmark: table outbox vs log messages vs append-only table with a cursor
+# Benchmark: table outbox vs log messages vs append-only tables, by cursor and by Debezium
 
-The same producer workload driven through four transports, measuring the effect on the
+The same producer workload driven through five transports, measuring the effect on the
 producer, the relay and the database. Numbers are from one laptop with every component
 in one virtual machine; ratios between transports matter more than absolute figures,
 and the caveats at the end say which figures are stable.
@@ -12,9 +12,10 @@ and the caveats at the end say which figures are stable.
 | Host | MacBook Pro, Intel Core i5-1038NG7 at 2.0 GHz, 4 cores / 8 threads, 16 GB RAM, NVMe SSD, macOS 26.1 |
 | Docker | Docker Desktop, engine 29.4.2, Apple Virtualization framework with VirtioFS, linux/amd64 |
 | Docker VM | 8 vCPUs, 8 GB RAM, 1 GB swap, 60 GB disk, kernel 6.12 linuxkit, overlay2 |
-| Postgres | 18.6, one instance per transport: `table` and `cursor` run `wal_level=replica` (the default), `wal` and `journal` run `wal_level=logical` with `max_slot_wal_keep_size=2GB`; all with `shared_buffers=512MB`, `max_connections=300`, `pg_stat_statements` loaded, default autovacuum settings |
+| Postgres | 18.6, one instance per transport: `table` and `cursor` run `wal_level=replica` (the default), `wal`, `journal` and `debezium` run `wal_level=logical` with `max_slot_wal_keep_size=2GB`; all with `shared_buffers=512MB`, `max_connections=300`, `pg_stat_statements` loaded, default autovacuum settings |
 | PgBouncer | edoburu/pgbouncer, transaction mode, pool of 64 server connections, one per Postgres |
-| Sink | simulated: every publish batch costs 200 ms and sends nothing, standing in for a Pub/Sub round trip |
+| Sink | simulated: every publish batch costs 200 ms and sends nothing, standing in for a Pub/Sub round trip; for `debezium` the same cost is charged by `/httpsink`, the counter its HTTP sink posts batches to |
+| Debezium Server | `quay.io/debezium/server:latest`, 3.7.1 at the time of the runs, HTTP sink with batching, offsets in a file |
 
 Everything shares the VM's four physical cores. One transport's stack is busy at a
 time.
@@ -26,7 +27,7 @@ payment inserts plus 10 events, from 32 concurrent producer connections through
 PgBouncer, each transaction pipelined as one batch. Event payload is about 190 bytes of
 JSON. Relays batch up to 1,000 messages; the log relays also flush every 500 ms.
 
-Four transports:
+Five transports:
 
 | mode | producer writes per event | relay |
 |---|---|---|
@@ -34,6 +35,7 @@ Four transports:
 | `wal` | `pg_logical_emit_message()` | stream the slot, publish, ack commit LSN |
 | `journal` | INSERT into `outbox_journal` with the emit inside the VALUES | as `wal`; journal read only after slot loss |
 | `cursor` | INSERT into `outbox_events` (append-only, partitioned day → target → shard, `xid` column) | N workers per replica, each: lock a shard's cursor row `FOR UPDATE SKIP LOCKED`, read forward from it in `(xid, id)` order, publish, advance the cursor, commit; no deletes, no slot, through PgBouncer |
+| `debezium` | INSERT into `outbox_events` (append-only, partitioned by day, no index) | Debezium Server streams the slot through a pgoutput publication (inserts only, via the partition root), routes with the Outbox Event Router, posts batches of up to 1,000 to the counter sink; no relay query at all |
 
 The cursor transport is run in three shapes, labelled `w<workers>x<replicas>`: one
 worker in one replica, which is a single publishing stream like the other relays; eight
@@ -48,13 +50,13 @@ Four scenarios:
 - **slotloss** (`journal` only): as backlog, but the replication slot is dropped before
   the relay restarts, simulating a failover that loses the slot. The relay recovers the
   window from the journal.
-- **longtxn** (`cursor` only): as concurrent, but one transaction that has written an
+- **longtxn** (`cursor` and `debezium`): as concurrent, but one transaction that has written an
   event is held open for 30 seconds across the whole run. The drain must not wait for
   it, and its event must be published once it commits.
 
 Between runs the transport's outbox table and `payments` are truncated and vacuumed,
-cursors are reset, statistics are reset, and for the log transports the slot is dropped
-and the relay state file removed. Each run reports the producer's own throughput and
+cursors are reset, statistics are reset, and for the log transports and `debezium` the
+slot is dropped and the relay state file or offset file removed. Each run reports the producer's own throughput and
 latency percentiles; the harness samples dead tuples, outbox size (including
 partitions), index size, slot lag and the Postgres container's CPU every half second
 and at the end reads `pg_stat_wal`, `pg_stat_user_tables`, `pg_stat_database`,
@@ -65,84 +67,84 @@ else touching an outbox table).
 
 ## Results
 
-Events per run: 100,000 in transactions of 10 with 32 producer workers; runs averaged per column: table/concurrent=1, wal/concurrent=1, journal/concurrent=1, cursor w1x1/concurrent=1, cursor w8x1/concurrent=1, cursor w8x2/concurrent=1, table/backlog=1, wal/backlog=1, journal/backlog=1, cursor w1x1/backlog=1, cursor w8x1/backlog=1, cursor w8x2/backlog=1, journal/slotloss=1, cursor w1x1/longtxn=1.
+Events per run: 100,000 in transactions of 10 with 32 producer workers; runs averaged per column: table/concurrent=1, wal/concurrent=1, journal/concurrent=1, cursor w1x1/concurrent=1, cursor w8x1/concurrent=1, cursor w8x2/concurrent=1, debezium/concurrent=1, table/backlog=1, wal/backlog=1, journal/backlog=1, cursor w1x1/backlog=1, cursor w8x1/backlog=1, cursor w8x2/backlog=1, debezium/backlog=1, journal/slotloss=1, cursor w1x1/longtxn=1, debezium/longtxn=1.
 
 ### Producer (Go, via PgBouncer)
 
-| metric | table / concurrent | wal / concurrent | journal / concurrent | cursor w1x1 / concurrent | cursor w8x1 / concurrent | cursor w8x2 / concurrent | table / backlog | wal / backlog | journal / backlog | cursor w1x1 / backlog | cursor w8x1 / backlog | cursor w8x2 / backlog | journal / slotloss | cursor w1x1 / longtxn |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| throughput, events/s | 12,622 | 15,087 | 13,090 | 9,800 | 15,548 | 5,441 | 14,693 | 13,960 | 12,483 | 15,712 | 17,313 | 8,416 | 14,538 | 16,887 |
-| throughput, transactions/s | 1,262 | 1,509 | 1,309 | 980 | 1,555 | 544 | 1,469 | 1,396 | 1,248 | 1,571 | 1,731 | 842 | 1,454 | 1,689 |
-| transaction latency p50, ms | 20.63 | 17.44 | 19.48 | 23.68 | 17.44 | 34.98 | 18.02 | 16.34 | 18.68 | 17.07 | 16.07 | 24.88 | 17.97 | 16.39 |
-| transaction latency p95, ms | 57.99 | 48.44 | 57.51 | 73.21 | 42.85 | 189.15 | 48.88 | 56.11 | 60.23 | 44.03 | 37.03 | 108.35 | 50.07 | 38.57 |
-| transaction latency p99, ms | 85.42 | 73.50 | 94.90 | 205.68 | 71.18 | 325.57 | 73.37 | 133.82 | 148.80 | 72.66 | 60.88 | 225.29 | 77.03 | 59.38 |
-| errors | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| metric | table / concurrent | wal / concurrent | journal / concurrent | cursor w1x1 / concurrent | cursor w8x1 / concurrent | cursor w8x2 / concurrent | debezium / concurrent | table / backlog | wal / backlog | journal / backlog | cursor w1x1 / backlog | cursor w8x1 / backlog | cursor w8x2 / backlog | debezium / backlog | journal / slotloss | cursor w1x1 / longtxn | debezium / longtxn |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| throughput, events/s | 12,622 | 15,087 | 13,090 | 9,800 | 15,548 | 5,441 | 4,870 | 14,693 | 13,960 | 12,483 | 15,712 | 17,313 | 8,416 | 17,862 | 14,538 | 16,887 | 10,742 |
+| throughput, transactions/s | 1,262 | 1,509 | 1,309 | 980 | 1,555 | 544 | 487 | 1,469 | 1,396 | 1,248 | 1,571 | 1,731 | 842 | 1,786 | 1,454 | 1,689 | 1,074 |
+| transaction latency p50, ms | 20.63 | 17.44 | 19.48 | 23.68 | 17.44 | 34.98 | 48.56 | 18.02 | 16.34 | 18.68 | 17.07 | 16.07 | 24.88 | 15.35 | 17.97 | 16.39 | 23.06 |
+| transaction latency p95, ms | 57.99 | 48.44 | 57.51 | 73.21 | 42.85 | 189.15 | 173.91 | 48.88 | 56.11 | 60.23 | 44.03 | 37.03 | 108.35 | 37.14 | 50.07 | 38.57 | 73.09 |
+| transaction latency p99, ms | 85.42 | 73.50 | 94.90 | 205.68 | 71.18 | 325.57 | 303.83 | 73.37 | 133.82 | 148.80 | 72.66 | 60.88 | 225.29 | 57.07 | 77.03 | 59.38 | 113.70 |
+| errors | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 
 ### Relay
 
-| metric | table / concurrent | wal / concurrent | journal / concurrent | cursor w1x1 / concurrent | cursor w8x1 / concurrent | cursor w8x2 / concurrent | table / backlog | wal / backlog | journal / backlog | cursor w1x1 / backlog | cursor w8x1 / backlog | cursor w8x2 / backlog | journal / slotloss | cursor w1x1 / longtxn |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| drain time, s (backlog/slotloss: relay start to last publish; concurrent: producer start to last publish) | 65.70 | 25.73 | 25.81 | 35.40 | 10.39 | 24.52 | 23.98 | 26.22 | 24.46 | 29.47 | 6.67 | 4.72 | 22.67 | 32.75 |
-| publish batches | 101 | 100 | 100 | 132 | 246 | 632 | 100 | 100 | 100 | 126 | 126 | 126 | 0 | 132 |
-| events replayed from journal | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 100,000 | 0 |
-| cursor: pollers per replica | - | - | - | 1 | 8 | 8 | - | - | - | 1 | 8 | 8 | - | 1 |
-| cursor: relay replicas | - | - | - | 1 | 1 | 2 | - | - | - | 1 | 1 | 2 | - | 1 |
-| longtxn: seconds the transaction was held open | - | - | - | - | - | - | - | - | - | - | - | - | - | 30 |
-| longtxn: s until its event was published too (from producer start) | - | - | - | - | - | - | - | - | - | - | - | - | - | 34.22 |
+| metric | table / concurrent | wal / concurrent | journal / concurrent | cursor w1x1 / concurrent | cursor w8x1 / concurrent | cursor w8x2 / concurrent | debezium / concurrent | table / backlog | wal / backlog | journal / backlog | cursor w1x1 / backlog | cursor w8x1 / backlog | cursor w8x2 / backlog | debezium / backlog | journal / slotloss | cursor w1x1 / longtxn | debezium / longtxn |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| drain time, s (backlog/slotloss: relay start to last publish; concurrent: producer start to last publish) | 65.70 | 25.73 | 25.81 | 35.40 | 10.39 | 24.52 | 72.33 | 23.98 | 26.22 | 24.46 | 29.47 | 6.67 | 4.72 | 53.40 | 22.67 | 32.75 | 60.42 |
+| publish batches | 101 | 100 | 100 | 132 | 246 | 632 | 148 | 100 | 100 | 100 | 126 | 126 | 126 | 147 | 0 | 132 | 145 |
+| events replayed from journal | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 100,000 | 0 | 0 |
+| cursor: pollers per replica | - | - | - | 1 | 8 | 8 | - | - | - | - | 1 | 8 | 8 | - | - | 1 | - |
+| cursor: relay replicas | - | - | - | 1 | 1 | 2 | - | - | - | - | 1 | 1 | 2 | - | - | 1 | - |
+| longtxn: seconds the transaction was held open | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | 30 | 30 |
+| longtxn: s until its event was published too (from producer start) | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | 34.22 | 60.66 |
 
 ### Database
 
-| metric | table / concurrent | wal / concurrent | journal / concurrent | cursor w1x1 / concurrent | cursor w8x1 / concurrent | cursor w8x2 / concurrent | table / backlog | wal / backlog | journal / backlog | cursor w1x1 / backlog | cursor w8x1 / backlog | cursor w8x2 / backlog | journal / slotloss | cursor w1x1 / longtxn |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| WAL bytes written | 90.27 MB | 42.14 MB | 81.08 MB | 55.40 MB | 53.67 MB | 56.61 MB | 72.65 MB | 42.12 MB | 81.09 MB | 55.85 MB | 52.14 MB | 54.08 MB | 81.25 MB | 56.07 MB |
-| WAL records | 725,005 | 313,327 | 516,854 | 417,474 | 405,436 | 413,596 | 728,522 | 314,080 | 517,913 | 418,436 | 395,051 | 409,402 | 521,089 | 418,572 |
-| outbox rows inserted | 100,000 | 0 | 100,000 | 100,000 | 96,970 | 98,520 | 100,000 | 0 | 100,000 | 100,000 | 94,560 | 97,960 | 100,000 | 100,001 |
-| outbox rows deleted | 100,000 | 0 | 0 | 0 | 0 | 0 | 100,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| outbox dead tuples, peak | 91,000 | 0 | 0 | 0 | 0 | 0 | 45,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| outbox dead tuples, end | 96,430 | 0 | 0 | 0 | 0 | 0 | 51,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| outbox table+index size, peak | 33.63 MB | 0.00 MB | 32.56 MB | 43.34 MB | 44.11 MB | 44.49 MB | 34.09 MB | 0.00 MB | 33.56 MB | 46.32 MB | 43.30 MB | 43.47 MB | 32.42 MB | 43.72 MB |
-| outbox table+index size, end | 33.63 MB | 0.00 MB | 32.56 MB | 43.34 MB | 44.11 MB | 45.33 MB | 34.09 MB | 0.00 MB | 33.56 MB | 46.32 MB | 43.30 MB | 43.47 MB | 32.42 MB | 43.72 MB |
-| autovacuum runs on outbox | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 1 | 2 | 0 | 0 | 1 | 32 |
-| buffer accesses (blks_hit) | 1,987,967 | 430,800 | 836,669 | 1,624,170 | 1,560,111 | 1,838,830 | 1,933,645 | 435,514 | 847,932 | 1,724,525 | 1,489,127 | 1,583,678 | 941,498 | 1,647,996 |
-| transactions committed | 10,372 | 10,133 | 10,133 | 10,321 | 10,067 | 10,630 | 10,272 | 10,143 | 10,147 | 10,388 | 9,704 | 10,027 | 10,180 | 10,477 |
-| slot lag, peak | 0.00 MB | 29.01 MB | 55.61 MB | 0.00 MB | 0.00 MB | 0.00 MB | 0.00 MB | 42.74 MB | 82.01 MB | 0.00 MB | 0.00 MB | 0.00 MB | 81.88 MB | 0.00 MB |
-| postgres container CPU, avg % | 99.7 | 86.0 | 90.9 | 86.8 | 251.2 | 321.5 | 96.7 | 72.7 | 79.0 | 68.5 | 202.8 | 170.4 | 78.0 | 85.8 |
-| postgres container CPU, max % | 469.2 | 411.1 | 430.3 | 498.1 | 488.1 | 547.5 | 489.8 | 449.1 | 485.5 | 471.6 | 480.9 | 453.4 | 460.6 | 470.0 |
+| metric | table / concurrent | wal / concurrent | journal / concurrent | cursor w1x1 / concurrent | cursor w8x1 / concurrent | cursor w8x2 / concurrent | debezium / concurrent | table / backlog | wal / backlog | journal / backlog | cursor w1x1 / backlog | cursor w8x1 / backlog | cursor w8x2 / backlog | debezium / backlog | journal / slotloss | cursor w1x1 / longtxn | debezium / longtxn |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| WAL bytes written | 90.27 MB | 42.14 MB | 81.08 MB | 55.40 MB | 53.67 MB | 56.61 MB | 46.84 MB | 72.65 MB | 42.12 MB | 81.09 MB | 55.85 MB | 52.14 MB | 54.08 MB | 46.84 MB | 81.25 MB | 56.07 MB | 46.84 MB |
+| WAL records | 725,005 | 313,327 | 516,854 | 417,474 | 405,436 | 413,596 | 320,070 | 728,522 | 314,080 | 517,913 | 418,436 | 395,051 | 409,402 | 320,616 | 521,089 | 418,572 | 316,349 |
+| outbox rows inserted | 100,000 | 0 | 100,000 | 100,000 | 96,970 | 98,520 | 100,000 | 100,000 | 0 | 100,000 | 100,000 | 94,560 | 97,960 | 100,000 | 100,000 | 100,001 | 100,001 |
+| outbox rows deleted | 100,000 | 0 | 0 | 0 | 0 | 0 | 0 | 100,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| outbox dead tuples, peak | 91,000 | 0 | 0 | 0 | 0 | 0 | 0 | 45,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| outbox dead tuples, end | 96,430 | 0 | 0 | 0 | 0 | 0 | 0 | 51,000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| outbox table+index size, peak | 33.63 MB | 0.00 MB | 32.56 MB | 43.34 MB | 44.11 MB | 44.49 MB | 28.48 MB | 34.09 MB | 0.00 MB | 33.56 MB | 46.32 MB | 43.30 MB | 43.47 MB | 28.62 MB | 32.42 MB | 43.72 MB | 28.27 MB |
+| outbox table+index size, end | 33.63 MB | 0.00 MB | 32.56 MB | 43.34 MB | 44.11 MB | 45.33 MB | 28.48 MB | 34.09 MB | 0.00 MB | 33.56 MB | 46.32 MB | 43.30 MB | 43.47 MB | 28.62 MB | 32.42 MB | 43.72 MB | 28.27 MB |
+| autovacuum runs on outbox | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 1 | 0 | 1 | 2 | 0 | 0 | 1 | 1 | 32 | 0 |
+| buffer accesses (blks_hit) | 1,987,967 | 430,800 | 836,669 | 1,624,170 | 1,560,111 | 1,838,830 | 1,006,676 | 1,933,645 | 435,514 | 847,932 | 1,724,525 | 1,489,127 | 1,583,678 | 1,026,279 | 941,498 | 1,647,996 | 983,109 |
+| transactions committed | 10,372 | 10,133 | 10,133 | 10,321 | 10,067 | 10,630 | 10,344 | 10,272 | 10,143 | 10,147 | 10,388 | 9,704 | 10,027 | 10,440 | 10,180 | 10,477 | 10,310 |
+| slot lag, peak | 0.00 MB | 29.01 MB | 55.61 MB | 0.00 MB | 0.00 MB | 0.00 MB | 33.16 MB | 0.00 MB | 42.74 MB | 82.01 MB | 0.00 MB | 0.00 MB | 0.00 MB | 47.25 MB | 81.88 MB | 0.00 MB | 40.58 MB |
+| postgres container CPU, avg % | 99.7 | 86.0 | 90.9 | 86.8 | 251.2 | 321.5 | 80.4 | 96.7 | 72.7 | 79.0 | 68.5 | 202.8 | 170.4 | 54.4 | 78.0 | 85.8 | 62.1 |
+| postgres container CPU, max % | 469.2 | 411.1 | 430.3 | 498.1 | 488.1 | 547.5 | 375.9 | 489.8 | 449.1 | 485.5 | 471.6 | 480.9 | 453.4 | 473.1 | 460.6 | 470.0 | 452.2 |
 
 ### Heap and indexes at the end of the run (pgstattuple, pgstatindex)
 
-| metric | table / concurrent | wal / concurrent | journal / concurrent | cursor w1x1 / concurrent | cursor w8x1 / concurrent | cursor w8x2 / concurrent | table / backlog | wal / backlog | journal / backlog | cursor w1x1 / backlog | cursor w8x1 / backlog | cursor w8x2 / backlog | journal / slotloss | cursor w1x1 / longtxn |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| outbox heap size | 27.34 MB | 0.00 MB | 28.38 MB | 33.19 MB | 33.95 MB | 35.17 MB | 27.79 MB | 0.00 MB | 29.34 MB | 36.14 MB | 33.14 MB | 33.32 MB | 28.19 MB | 33.30 MB |
-| outbox heap dead tuple space, % | 32.5 | - | 0.0 | 0.0 | 0.0 | 0.0 | 14.9 | - | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
-| outbox heap free space, % | 65.8 | - | 2.7 | 14.6 | 16.5 | 19.4 | 82.4 | - | 3.3 | 21.6 | 14.5 | 14.9 | 2.3 | 14.9 |
-| outbox index size, end | 6.25 MB | 0.00 MB | 4.08 MB | 6.41 MB | 6.41 MB | 6.41 MB | 6.26 MB | 0.00 MB | 4.10 MB | 6.41 MB | 6.41 MB | 6.41 MB | 4.12 MB | 6.41 MB |
-| outbox index size, peak | 6.25 MB | 0.00 MB | 4.08 MB | 6.41 MB | 6.41 MB | 6.41 MB | 6.26 MB | 0.00 MB | 4.10 MB | 6.41 MB | 6.41 MB | 6.41 MB | 4.12 MB | 6.41 MB |
-| outbox index count | 2 | 0 | 10 | 361 | 361 | 361 | 2 | 0 | 10 | 361 | 361 | 361 | 10 | 361 |
-| outbox index leaf density, % (page-weighted) | 91.1 | - | 91.7 | 88.3 | 88.3 | 88.3 | 90.8 | - | 91.1 | 88.3 | 88.3 | 88.3 | 90.8 | 88.3 |
-| outbox index leaf fragmentation, % | 0.3 | - | 0.2 | 0.0 | 0.0 | 0.0 | 0.3 | - | 0.0 | 0.0 | 0.0 | 0.0 | 0.2 | 0.0 |
-| outbox index deleted + empty pages | 26 | 0 | 0 | 0 | 0 | 0 | 363 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| outbox row updates | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| cursor table size (cursor only) | 0 kB | 0 kB | 0 kB | 49 kB | 82 kB | 74 kB | 0 kB | 0 kB | 0 kB | 49 kB | 49 kB | 49 kB | 0 kB | 90 kB |
-| cursor row updates | 0 | 0 | 0 | 132 | 241 | 634 | 0 | 0 | 0 | 126 | 136 | 125 | 0 | 151 |
-| cursor row updates that were HOT | 0 | 0 | 0 | 132 | 236 | 619 | 0 | 0 | 0 | 126 | 136 | 125 | 0 | 125 |
-| cursor row dead tuples, end | 0 | 0 | 0 | 3 | 24 | 43 | 0 | 0 | 0 | 6 | 8 | 1 | 0 | 62 |
+| metric | table / concurrent | wal / concurrent | journal / concurrent | cursor w1x1 / concurrent | cursor w8x1 / concurrent | cursor w8x2 / concurrent | debezium / concurrent | table / backlog | wal / backlog | journal / backlog | cursor w1x1 / backlog | cursor w8x1 / backlog | cursor w8x2 / backlog | debezium / backlog | journal / slotloss | cursor w1x1 / longtxn | debezium / longtxn |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| outbox heap size | 27.34 MB | 0.00 MB | 28.38 MB | 33.19 MB | 33.95 MB | 35.17 MB | 28.37 MB | 27.79 MB | 0.00 MB | 29.34 MB | 36.14 MB | 33.14 MB | 33.32 MB | 28.52 MB | 28.19 MB | 33.30 MB | 28.17 MB |
+| outbox heap dead tuple space, % | 32.5 | - | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 14.9 | - | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| outbox heap free space, % | 65.8 | - | 2.7 | 14.6 | 16.5 | 19.4 | 3.0 | 82.4 | - | 3.3 | 21.6 | 14.5 | 14.9 | 2.6 | 2.3 | 14.9 | 2.3 |
+| outbox index size, end | 6.25 MB | 0.00 MB | 4.08 MB | 6.41 MB | 6.41 MB | 6.41 MB | 0.00 MB | 6.26 MB | 0.00 MB | 4.10 MB | 6.41 MB | 6.41 MB | 6.41 MB | 0.00 MB | 4.12 MB | 6.41 MB | 0.00 MB |
+| outbox index size, peak | 6.25 MB | 0.00 MB | 4.08 MB | 6.41 MB | 6.41 MB | 6.41 MB | 0.00 MB | 6.26 MB | 0.00 MB | 4.10 MB | 6.41 MB | 6.41 MB | 6.41 MB | 0.00 MB | 4.12 MB | 6.41 MB | 0.00 MB |
+| outbox index count | 2 | 0 | 10 | 361 | 361 | 361 | 0 | 2 | 0 | 10 | 361 | 361 | 361 | 0 | 10 | 361 | 0 |
+| outbox index leaf density, % (page-weighted) | 91.1 | - | 91.7 | 88.3 | 88.3 | 88.3 | - | 90.8 | - | 91.1 | 88.3 | 88.3 | 88.3 | - | 90.8 | 88.3 | - |
+| outbox index leaf fragmentation, % | 0.3 | - | 0.2 | 0.0 | 0.0 | 0.0 | - | 0.3 | - | 0.0 | 0.0 | 0.0 | 0.0 | - | 0.2 | 0.0 | - |
+| outbox index deleted + empty pages | 26 | 0 | 0 | 0 | 0 | 0 | 0 | 363 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| outbox row updates | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| cursor table size (cursor only) | 0 kB | 0 kB | 0 kB | 49 kB | 82 kB | 74 kB | 0 kB | 0 kB | 0 kB | 0 kB | 49 kB | 49 kB | 49 kB | 0 kB | 0 kB | 90 kB | 0 kB |
+| cursor row updates | 0 | 0 | 0 | 132 | 241 | 634 | 0 | 0 | 0 | 0 | 126 | 136 | 125 | 0 | 0 | 151 | 0 |
+| cursor row updates that were HOT | 0 | 0 | 0 | 132 | 236 | 619 | 0 | 0 | 0 | 0 | 126 | 136 | 125 | 0 | 0 | 125 | 0 |
+| cursor row dead tuples, end | 0 | 0 | 0 | 3 | 24 | 43 | 0 | 0 | 0 | 0 | 6 | 8 | 1 | 0 | 0 | 62 | 0 |
 
 ### Statements (pg_stat_statements): producer side = business insert + event write; relay side = everything else on an outbox table
 
-| metric | table / concurrent | wal / concurrent | journal / concurrent | cursor w1x1 / concurrent | cursor w8x1 / concurrent | cursor w8x2 / concurrent | table / backlog | wal / backlog | journal / backlog | cursor w1x1 / backlog | cursor w8x1 / backlog | cursor w8x2 / backlog | journal / slotloss | cursor w1x1 / longtxn |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| producer: calls | 200,000 | 200,000 | 200,000 | 200,001 | 200,001 | 200,002 | 200,000 | 200,000 | 200,000 | 200,002 | 200,002 | 200,004 | 200,000 | 200,002 |
-| producer: total exec time, s | 103.06 | 62.40 | 100.18 | 94.16 | 44.40 | 83.73 | 62.51 | 43.52 | 64.53 | 52.49 | 35.76 | 62.20 | 52.09 | 40.45 |
-| producer: exec time per 1,000 events, ms | 1030.6 | 624.0 | 1001.8 | 941.6 | 444.0 | 837.3 | 625.1 | 435.2 | 645.3 | 524.9 | 357.6 | 622.0 | 520.9 | 404.5 |
-| producer: blocks dirtied per 1,000 events | 51.3 | 10.3 | 49.8 | 56.0 | 56.9 | 58.4 | 51.4 | 10.3 | 49.9 | 59.7 | 55.7 | 56.0 | 49.5 | 56.0 |
-| producer: WAL bytes per event | 603 | 416 | 805 | 550 | 549 | 582 | 603 | 416 | 805 | 549 | 547 | 548 | 805 | 548 |
-| relay: calls | 132 | 0 | 0 | 494 | 1,475 | 4,320 | 118 | 0 | 0 | 429 | 869 | 1,290 | 1 | 571 |
-| relay: total exec time, s | 41.44 | 0.00 | 0.00 | 0.47 | 0.77 | 3.97 | 0.87 | 0.00 | 0.00 | 0.31 | 0.49 | 0.55 | 0.87 | 0.37 |
-| relay: exec time per 1,000 events, ms | 414.4 | 0.0 | 0.0 | 4.7 | 7.7 | 39.7 | 8.7 | 0.0 | 0.0 | 3.1 | 4.9 | 5.5 | 8.7 | 3.7 |
-| relay: blocks hit per 1,000 events | 9,240 | 0 | 0 | 117 | 892 | 1,053 | 8,913 | 0 | 0 | 396 | 1,005 | 1,012 | 912 | 185 |
-| relay: blocks dirtied per 1,000 events | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
-| relay: WAL bytes per event | 292 | 0 | 0 | 0 | 1 | 2 | 111 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| metric | table / concurrent | wal / concurrent | journal / concurrent | cursor w1x1 / concurrent | cursor w8x1 / concurrent | cursor w8x2 / concurrent | debezium / concurrent | table / backlog | wal / backlog | journal / backlog | cursor w1x1 / backlog | cursor w8x1 / backlog | cursor w8x2 / backlog | debezium / backlog | journal / slotloss | cursor w1x1 / longtxn | debezium / longtxn |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| producer: calls | 200,000 | 200,000 | 200,000 | 200,001 | 200,001 | 200,002 | 200,000 | 200,000 | 200,000 | 200,000 | 200,002 | 200,002 | 200,004 | 200,000 | 200,000 | 200,002 | 200,001 |
+| producer: total exec time, s | 103.06 | 62.40 | 100.18 | 94.16 | 44.40 | 83.73 | 222.33 | 62.51 | 43.52 | 64.53 | 52.49 | 35.76 | 62.20 | 48.14 | 52.09 | 40.45 | 62.83 |
+| producer: exec time per 1,000 events, ms | 1030.6 | 624.0 | 1001.8 | 941.6 | 444.0 | 837.3 | 2223.3 | 625.1 | 435.2 | 645.3 | 524.9 | 357.6 | 622.0 | 481.4 | 520.9 | 404.5 | 628.2 |
+| producer: blocks dirtied per 1,000 events | 51.3 | 10.3 | 49.8 | 56.0 | 56.9 | 58.4 | 45.1 | 51.4 | 10.3 | 49.9 | 59.7 | 55.7 | 56.0 | 44.8 | 49.5 | 56.0 | 44.7 |
+| producer: WAL bytes per event | 603 | 416 | 805 | 550 | 549 | 582 | 461 | 603 | 416 | 805 | 549 | 547 | 548 | 461 | 805 | 548 | 464 |
+| relay: calls | 132 | 0 | 0 | 494 | 1,475 | 4,320 | 0 | 118 | 0 | 0 | 429 | 869 | 1,290 | 0 | 1 | 571 | 0 |
+| relay: total exec time, s | 41.44 | 0.00 | 0.00 | 0.47 | 0.77 | 3.97 | 0.00 | 0.87 | 0.00 | 0.00 | 0.31 | 0.49 | 0.55 | 0.00 | 0.87 | 0.37 | 0.00 |
+| relay: exec time per 1,000 events, ms | 414.4 | 0.0 | 0.0 | 4.7 | 7.7 | 39.7 | 0.0 | 8.7 | 0.0 | 0.0 | 3.1 | 4.9 | 5.5 | 0.0 | 8.7 | 3.7 | 0.0 |
+| relay: blocks hit per 1,000 events | 9,240 | 0 | 0 | 117 | 892 | 1,053 | 0 | 8,913 | 0 | 0 | 396 | 1,005 | 1,012 | 0 | 912 | 185 | 0 |
+| relay: blocks dirtied per 1,000 events | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| relay: WAL bytes per event | 292 | 0 | 0 | 0 | 1 | 2 | 0 | 111 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 
 ### Top statements per run (pg_stat_statements, concurrent scenario unless noted)
 
@@ -202,6 +204,13 @@ The log relays' replication stream is not a statement and does not appear; their
 | relay | `UPDATE outbox_cursor SET xid = $1, id = $2, pending = $3, catchup_xid = $4, catchup_id = $5, updated_at = n...` | 640 | 411 | 0.642 | 3,162 | 3 | 165,327 |
 | relay | `SELECT id, xid, key, payload FROM outbox_events WHERE target = $1 AND outbox_shard(key, $7) = $2 AND xid = ...` | 599 | 250 | 0.418 | 2,497 | 0 | 0 |
 
+**debezium / concurrent**
+
+| side | statement | calls | total ms | mean ms | blks hit | blks dirtied | WAL bytes |
+|---|---|---|---|---|---|---|---|
+| producer | `INSERT INTO payments (reference, amount_cents) VALUES ($1, $2)` | 100,000 | 192,156 | 1.922 | 405,392 | 1,046 | 15,628,657 |
+| producer | `INSERT INTO outbox_events (target, key, payload) VALUES ($1, $2, $3)` | 100,000 | 30,172 | 0.302 | 215,518 | 3,466 | 30,470,205 |
+
 **journal / slotloss**
 
 | side | statement | calls | total ms | mean ms | blks hit | blks dirtied | WAL bytes |
@@ -220,38 +229,39 @@ The log relays' replication stream is not a statement and does not appear; their
 | relay | `SELECT xid, id, pending, catchup_xid, catchup_id, array(SELECT pg_snapshot_xip(pg_current_snapshot())) FROM...` | 181 | 17 | 0.093 | 629 | 0 | 10,224 |
 | relay | `UPDATE outbox_cursor SET xid = $1, id = $2, pending = $3, catchup_xid = $4, catchup_id = $5, updated_at = n...` | 160 | 11 | 0.067 | 837 | 4 | 33,828 |
 
-Drain time in the concurrent scenarios includes the producer's own run, which is 6 to
-11 seconds depending on the transport. With a 200 ms sink cost per batch, the publish
-floor is 20 seconds for a single stream of 100 batches of 1,000; the cursor transport
-publishes per shard, so its single stream needs about 130 batches and a 26-second floor.
-Eight concurrent workers divide that floor by eight.
+**debezium / longtxn**
+
+| side | statement | calls | total ms | mean ms | blks hit | blks dirtied | WAL bytes |
+|---|---|---|---|---|---|---|---|
+| producer | `INSERT INTO payments (reference, amount_cents) VALUES ($1, $2)` | 100,000 | 48,928 | 0.489 | 404,361 | 1,026 | 15,781,306 |
+| producer | `INSERT INTO outbox_events (target, key, payload) VALUES ($1, $2, $3)` | 100,000 | 13,896 | 0.139 | 215,557 | 3,442 | 30,603,047 |
 
 ## Findings
 
 **Headline comparison.** Physical-state and backlog figures are stable across reruns;
 concurrent-scenario figures are indicative only (see Caveats).
 
-| | table | wal | journal | cursor, 1 stream | cursor, 8 workers | cursor, 8 × 2 replicas |
-|---|---|---|---|---|---|---|
-| producer throughput, events/s (concurrent) | 12,622 | 15,087 | 13,090 | 9,800 | 15,548 | 5,441 |
-| producer p99 latency, ms (concurrent) | 85 | 74 | 95 | 206 | 71 | 326 |
-| drain, producer start to last publish, s | 65.7 | 25.7 | 25.8 | 35.4 | 10.4 | 24.5 |
-| drain of a 100,000 backlog, relay alone, s | 24.0 | 26.2 | 24.5 | 29.5 | 6.7 | 4.7 |
-| publish rate on that backlog, events/s | 4,170 | 3,814 | 4,088 | 3,393 | 14,993 | 21,186 |
-| dead tuples at peak (concurrent) | 91,000 | 0 | 0 | 0 | 0 | 0 |
-| heap dead space at end, % (concurrent) | 32.5 | - | 0.0 | 0.0 | 0.0 | 0.0 |
-| heap free space at end, % (concurrent) | 65.8 | - | 2.7 | 14.6 | 16.5 | 19.4 |
-| index size at end | 6.3 MB | - | 4.1 MB | 6.4 MB | 6.4 MB | 6.4 MB |
-| index leaf density, % | 91.1 | - | 91.7 | 88.3 | 88.3 | 88.3 |
-| index deleted + empty pages (backlog, after vacuum) | 363 | - | 0 | 0 | 0 | 0 |
-| WAL bytes (concurrent) | 90 MB | 42 MB | 81 MB | 55 MB | 54 MB | 57 MB |
-| buffer accesses (concurrent) | 1,987,967 | 430,800 | 836,669 | 1,624,170 | 1,560,111 | 1,838,830 |
-| relay statement time per 1,000 events, ms (concurrent) | 414.4 | - | - | 4.7 | 7.7 | 39.7 |
-| relay statement time per 1,000 events, ms (backlog) | 8.7 | - | - | 3.1 | 4.9 | 5.5 |
-| relay blocks hit per 1,000 events (concurrent) | 9,240 | - | 0 | 117 | 892 | 1,053 |
-| relay WAL bytes per event (concurrent) | 292 | - | 0 | 0 | 1 | 2 |
-| producer statement time per 1,000 events, ms (backlog, producer alone) | 625.1 | 435.2 | 645.3 | 524.9 | 357.6 | 622.0 |
-| needs `wal_level=logical` | no | yes | yes | no | no | no |
+| | table | wal | journal | cursor, 1 stream | cursor, 8 workers | cursor, 8 × 2 replicas | debezium |
+|---|---|---|---|---|---|---|---|
+| producer throughput, events/s (concurrent) | 12,622 | 15,087 | 13,090 | 9,800 | 15,548 | 5,441 | 4,870 |
+| producer p99 latency, ms (concurrent) | 85 | 74 | 95 | 206 | 71 | 326 | 304 |
+| drain, producer start to last publish, s | 65.7 | 25.7 | 25.8 | 35.4 | 10.4 | 24.5 | 72.3 |
+| drain of a 100,000 backlog, relay alone, s | 24.0 | 26.2 | 24.5 | 29.5 | 6.7 | 4.7 | 53.4 |
+| publish rate on that backlog, events/s | 4,170 | 3,814 | 4,088 | 3,393 | 14,993 | 21,186 | 1,873 |
+| dead tuples at peak (concurrent) | 91,000 | 0 | 0 | 0 | 0 | 0 | 0 |
+| heap dead space at end, % (concurrent) | 32.5 | - | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| heap free space at end, % (concurrent) | 65.8 | - | 2.7 | 14.6 | 16.5 | 19.4 | 3.0 |
+| index size at end | 6.3 MB | - | 4.1 MB | 6.4 MB | 6.4 MB | 6.4 MB | none |
+| index leaf density, % | 91.1 | - | 91.7 | 88.3 | 88.3 | 88.3 | - |
+| index deleted + empty pages (backlog, after vacuum) | 363 | - | 0 | 0 | 0 | 0 | - |
+| WAL bytes (concurrent) | 90 MB | 42 MB | 81 MB | 55 MB | 54 MB | 57 MB | 47 MB |
+| buffer accesses (concurrent) | 1,987,967 | 430,800 | 836,669 | 1,624,170 | 1,560,111 | 1,838,830 | 1,006,676 |
+| relay statement time per 1,000 events, ms (concurrent) | 414.4 | - | - | 4.7 | 7.7 | 39.7 | - |
+| relay statement time per 1,000 events, ms (backlog) | 8.7 | - | - | 3.1 | 4.9 | 5.5 | - |
+| relay blocks hit per 1,000 events (concurrent) | 9,240 | - | 0 | 117 | 892 | 1,053 | 0 |
+| relay WAL bytes per event (concurrent) | 292 | - | 0 | 0 | 1 | 2 | 0 |
+| producer statement time per 1,000 events, ms (backlog, producer alone) | 625.1 | 435.2 | 645.3 | 524.9 | 357.6 | 622.0 | 481.4 |
+| needs `wal_level=logical` | no | yes | yes | no | no | no | yes |
 
 1. **Dead tuples, heap bloat and relay contention are all `table`-only, and the cursor
    transport avoids them on a plain Postgres.** The delete-based outbox peaked at 91,000
@@ -313,8 +323,25 @@ concurrent-scenario figures are indicative only (see Caveats).
    statement. Their price is `wal_level=logical`, a slot per target and one stream per
    slot.
 
+8. **`debezium` is the lightest table and the slowest single stream.** With no index
+   and nothing reading it, the heap ended at 28 MB for 100,000 rows, 3 percent free,
+   zero dead tuples and no relay statement at all; 47 MB of WAL, next to `wal`'s 42
+   and below `cursor`'s 55 and `journal`'s 81. But one Debezium Server drained the
+   100,000 backlog in 53.4 seconds, 1,873 events per second, about half of a Go
+   relay's single stream. Its 147 sink batches account for 29 seconds of that; the
+   rest is the engine, which expands each payload to JSON and encodes headers before
+   posting, on cores it shares with Postgres. In the concurrent run the producers
+   slowed to 4,870 events per second with a p99 of 304 ms as the JVM competed with
+   32 producer connections and Postgres for four cores, so treat that figure as
+   indicative only. The long transaction did not stall it: drain took 60.4 seconds
+   against 72.3 without the held transaction, and the held event arrived at 60.7
+   seconds, delivered in commit order when the stream reached its commit, with no
+   catch-up path needed.
+
 **What this means for the decision.** If logical decoding is available, `wal` or
-`journal` is the lightest way to stop an outbox table from bloating. If it is not,
+`journal` is the lightest way to stop an outbox table from bloating, and `debezium`
+is the way to do it with no relay code and a table that stays visible in SQL, at the
+throughput of one stream per slot. If it is not,
 `cursor` removes the dead tuples, the index decay and the relay-versus-producer
 contention with an ordinary Postgres and a pooler, keeps the table visible in SQL,
 tolerates long transactions, and turns publishing rate into a replica count. Its costs
@@ -345,13 +372,16 @@ retained.
   figure as indicative only. Backlog drains, where the relay runs alone, moved by
   under 20 percent. Physical-state numbers (dead space, index density, deleted pages)
   did not move at all.
-- Default autovacuum settings. A production outbox table would be tuned more
+- Default autovacuum settings. A real outbox table would be tuned more
   aggressively, which shortens the vacuum lag for `table` but does not change the
   amount of dead tuples it creates or the index pages it leaves behind.
 - The simulated sink's 200 ms is a stand-in. Real Pub/Sub publish latency from inside
   the same region is typically lower; from a laptop it is higher. It affects all
   transports equally, and it is the reason the cursor transport's shard count shows up
   as extra batches.
+- Debezium Server's JVM shares the same four cores. Its concurrent-scenario producer
+  figures and its drain time reflect that contention as much as the engine itself; on
+  a host where the publisher has its own cores both would improve.
 - The cursor replica runs share one PgBouncer with a 64-connection pool alongside the
   32 producer connections, so sixteen pollers fit; more would queue on the pooler
   before they queued on Postgres.

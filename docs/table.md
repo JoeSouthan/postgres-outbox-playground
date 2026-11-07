@@ -76,7 +76,7 @@ with zero dead space.
 | R9 cannot get stuck | ✅ | A dead-letter flag column: a rejected row is flagged in place and skipped by the claim, and republishing is clearing the flag. Trivial because the relay has no position, it just scans for unflagged rows. |
 | R10 ordering | insert order | Batches are claimed in id order, but with several relays batches can overtake each other, so even per-key order is not guaranteed under replicas. Not required. |
 
-## Before production
+## Before real use
 
 Aggressive autovacuum settings on `outbox_items`, a scheduled REINDEX or `pg_repack`,
 the materialised-CTE claim, and alarms on dead tuples and index size.

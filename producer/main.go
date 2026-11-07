@@ -7,6 +7,8 @@
 //	         (log message for delivery, append-only journal for recovery)
 //	cursor   INSERT INTO outbox_events                    (append-only, read by cursor;
 //	         no logical decoding, no deletes)
+//	debezium INSERT INTO outbox_events                    (append-only, decoded from the
+//	         log by Debezium Server; same statement as cursor, no index)
 //
 // Every statement in a transaction is pipelined in one batch so each worker keeps a
 // server backend busy; the worker count sets the concurrency. It talks to PgBouncer in
@@ -69,7 +71,7 @@ func main() {
 	var cfg config
 	var targets string
 	flag.StringVar(&cfg.dsn, "dsn", env("PRODUCER_DSN", "postgres://outbox:outbox@pgbouncer:5432/outbox"), "database DSN (normally PgBouncer)")
-	flag.StringVar(&cfg.mode, "mode", env("OUTBOX_MODE", "wal"), "transport: table | wal | journal | cursor")
+	flag.StringVar(&cfg.mode, "mode", env("OUTBOX_MODE", "wal"), "transport: table | wal | journal | cursor | debezium")
 	flag.StringVar(&targets, "targets", env("OUTBOX_TARGETS", "target_1"), "comma-separated targets, assigned round-robin per transaction")
 	flag.IntVar(&cfg.events, "events", envInt("PRODUCER_EVENTS", 100000), "total events to emit")
 	flag.IntVar(&cfg.perTxn, "per-txn", envInt("PRODUCER_PER_TXN", 10), "payments (and events) per transaction")
@@ -231,10 +233,10 @@ func emitStatement(mode string) (string, bool, error) {
 		return `SELECT pg_logical_emit_message(true, $1, $2::text)`, false, nil
 	case "journal":
 		return `INSERT INTO outbox_journal (target, payload, lsn) VALUES ($1, $2, pg_logical_emit_message(true, $1, $2::text))`, false, nil
-	case "cursor":
+	case "cursor", "debezium":
 		return `INSERT INTO outbox_events (target, key, payload) VALUES ($1, $2, $3)`, true, nil
 	}
-	return "", false, fmt.Errorf("unknown mode %q (table | wal | journal | cursor)", mode)
+	return "", false, fmt.Errorf("unknown mode %q (table | wal | journal | cursor | debezium)", mode)
 }
 
 // payload mirrors what an application would emit: an id for dedupe, a type, the

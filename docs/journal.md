@@ -75,7 +75,7 @@ benchmark's slot-loss run replayed exactly 100,000 rows in 22.7 seconds.
 transaction's commit record. A transaction that wrote early and committed late can
 hold a position below one already acknowledged; streaming handles it because it is
 commit-ordered, but a replay from the exact acknowledged position would miss it. A
-production relay must widen the window downward by the longest producer transaction
+real relay must widen the window downward by the longest producer transaction
 and rely on consumer dedupe. The prototype replays from the exact position.
 
 **Retention.** The journal recovers only what it still holds. Keep partitions longer
